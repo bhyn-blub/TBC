@@ -247,40 +247,90 @@ _CAUSE_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
     ("comm_bus_failure", ("bus", "controller", "every tag", "all the tags")),
     ("sensor_drift", ("drift", "reads slowly off")),
     ("loose_wiring", ("loose", "wiring", "terminal", "flicker")),
-    ("sensor_hardware_failure", ("sensor is dead", "end of life", "calibration")),
+    ("sensor_hardware_failure", ("thermistor", "sensor is dead", "open-circuit",
+                                 "stuck reading", "reads nothing")),
     ("cavitation", ("cavitation", "gravel", "marbles")),
     ("bearing_wear", ("bearing", "grinding")),
     ("battery_eol", ("battery", "batteries")),
 ]
+
+# When one *clause* reads like two causes at once (e.g. "the UPS batteries are
+# at end of life" matches both `battery_eol` via "batteries" and, before the
+# keyword split above, a generic "end of life" too), the most domain-specific
+# cause wins. Order matters: earlier = more specific for the same words.
+_CAUSE_PRIORITY: tuple[str, ...] = (
+    "battery_eol",
+    "cavitation",
+    "bearing_wear",
+    "refrigerant_leak",
+    "condenser_fouling",
+    "loose_wiring",
+    "comm_bus_failure",
+    "sensor_drift",
+    "sensor_hardware_failure",
+)
+
 _CHECK_WORDS = ("check", "look at", "first thing", "confirm", "measure", "listen")
 _DONT_STARTS = ("never ", "don't ", "do not ", "dont ")
 _ESCALATE_WORDS = ("call", "escalate", "vendor", "safety officer", "get the")
 
-# A sentence that explicitly rules a cause out must not draft a heuristic
-# for it -- e.g. "it's not the bus, not the controller, just a dead sensor"
-# mentions "bus"/"controller" while denying them. Plain keyword-in-sentence
-# matching has no way to tell presence from denial; this closes that gap.
+# Evaluation works on *clauses*, not whole sentences, so a sentence that both
+# denies one suspect and names a real one ("not the bus, but the thermistor is
+# open-circuit") keeps the denial from swallowing the diagnosis, and vice
+# versa. Each clause below is a unit of scope for negation and exoneration.
+_CLAUSE_RE = re.compile(
+    r"\s*[,;]\s*|\s+(?:but|yet|although|though|whereas|while)\s+",
+    re.IGNORECASE,
+)
+
+# A clause that denies a cause must not draft a heuristic for it -- e.g. "it's
+# not the bus, not the controller, just a dead sensor" mentions "bus"/"controller"
+# while denying them. Plain keyword matching cannot tell presence from denial.
 _NEGATION_PATTERN = re.compile(
-    r"\b(not|n't|never|no\s+issue|ruled?\s+out|nothing\s+wrong\s+with|"
-    r"not\s+the\s+case|unrelated\s+to)\b",
+    r"\b(?:not|never|no\s+issue|ruled?\s+out|nothing\s+wrong\s+with|"
+    r"not\s+the\s+case|unrelated\s+to)\b|n't",
+    re.IGNORECASE,
+)
+
+# A clause that *exonerates* a suspect ("every tag on that bus was reporting
+# fine", "the terminal was seated properly") rules that cause out even without
+# a negation word -- the expert said the part was fine, so it isn't the cause.
+_EXONERATION_PATTERN = re.compile(
+    r"\b(?:report(?:s|ed|ing)?|read(?:s|ing)?|is|are|was|were)\s+"
+    r"(?:fine|normal|ok(?:ay)?|good|correct|within\s+(?:spec|range|limits))\b"
+    r"|\b(?:seated|secured|fastened|tightened|connected)\s+properly\b"
+    r"|\bproperly\s+(?:seated|secured|fastened|tightened|connected)\b",
     re.IGNORECASE,
 )
 
 
-def _keyword_in_sentence(keyword: str, sentence_lower: str) -> bool:
+def _keyword_in_sentence(keyword: str, clause_lower: str) -> bool:
     """Word-boundary match for a single word; substring match for a phrase
     (phrases are specific enough already, and don't have the "bus" inside
     "business" problem a single short word does)."""
     if " " in keyword:
-        return keyword in sentence_lower
-    return re.search(rf"\b{re.escape(keyword)}\b", sentence_lower) is not None
+        return keyword in clause_lower
+    return re.search(rf"\b{re.escape(keyword)}\b", clause_lower) is not None
 
 
-def _sentence_triggers_cause(sentence: str, keywords: tuple[str, ...]) -> bool:
-    lowered = sentence.lower()
+def _clauses(sentence: str) -> list[str]:
+    """Split a sentence into scopes where negation/exoneration apply."""
+    return [c.strip() for c in _CLAUSE_RE.split(sentence) if c.strip()]
+
+
+def _clause_triggers_cause(clause: str, keywords: tuple[str, ...]) -> bool:
+    """True iff this clause names a cause WITHOUT denying or exonerating it.
+
+    Denial and exoneration are scoped to the clause so "not the bus, but the
+    thermistor is open-circuit" still drafts the sensor heuristic (the positive
+    clause is untouched by the denial in the next clause over).
+    """
+    lowered = clause.lower()
     if not any(_keyword_in_sentence(k, lowered) for k in keywords):
         return False
-    return not _NEGATION_PATTERN.search(lowered)
+    if _NEGATION_PATTERN.search(lowered):
+        return False
+    return not _EXONERATION_PATTERN.search(lowered)
 
 
 _SPEAKER = re.compile(r"^[A-Z][^:]{0,60}:\s*")
@@ -297,18 +347,35 @@ def _paragraphs(text: str) -> list[list[str]]:
 
 def _mock_extract(transcript: str) -> dict[str, Any]:
     paragraphs = _paragraphs(transcript)
+
+    # Collect every (paragraph, sentence, clause) that names a cause. A single
+    # clause can sound like two causes at once; resolve those collisions by
+    # keeping only the most domain-specific cause named in that clause.
+    rank = {cause: i for i, cause in enumerate(_CAUSE_PRIORITY)}
+    named: dict[tuple[int, int, int], str] = {}
+    for pi, para in enumerate(paragraphs):
+        for si, sentence in enumerate(para):
+            for ci, clause in enumerate(_clauses(sentence)):
+                if sentence.lower().startswith("interviewer"):
+                    continue
+                for cause, keywords in _CAUSE_KEYWORDS:
+                    if not _clause_triggers_cause(clause, keywords):
+                        continue
+                    prev = named.get((pi, si, ci))
+                    if prev is None or rank[cause] < rank[prev]:
+                        named[(pi, si, ci)] = cause
+
     heuristics: list[dict[str, Any]] = []
     for cause, keywords in _CAUSE_KEYWORDS:
         hit = next(
-            ((p, i) for p in paragraphs for i, s in enumerate(p)
-             if not s.lower().startswith("interviewer")
-             and _sentence_triggers_cause(s, keywords)),
+            ((pi, si) for (pi, si, _ci), cause2 in named.items()
+             if cause2 == cause),
             None,
         )
         if hit is None:
             continue
-        para, i = hit
-        window = para[i:]  # the rest of the expert's answer
+        pi, i = hit
+        window = paragraphs[pi][i:]  # the rest of the expert's answer
         bare = [_SPEAKER.sub("", s) for s in window]
 
         heuristics.append({

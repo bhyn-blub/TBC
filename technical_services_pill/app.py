@@ -12,6 +12,7 @@ Endpoints:
     POST   /cases/{id}/outcome             record maintenance outcome  (technician)
     POST   /cases/{id}/feedback            submit feedback             (steward)
     GET    /audit/trace                    tamper-evident audit trail   (auditor)
+    GET    /system/integrity               integrity/tamper events     (auditor)
 
 Identity via a signed session cookie set by ``POST /login`` (see ``auth.py``);
 ``?user=<demo_user_id>`` is a fallback only under ``TBC_DEMO_INSECURE=1``.
@@ -1011,6 +1012,15 @@ def get_audit_trace(
 ) -> dict:
     _need(user, "read_audit_trail")
     return {"entries": STORE.all_audit_traces(actor=actor, case_id=case_id)}
+
+
+@app.get("/system/integrity")
+def get_system_integrity(user: str = Depends(resolve_user)) -> dict:
+    """Integrity events (archived tamper evidence) this deployment has seen."""
+    from . import persistence
+
+    _need(user, "read_audit_trail")
+    return {"events": persistence.integrity_events()}
 
 
 # --- helpers ---------------------------------------------------------------

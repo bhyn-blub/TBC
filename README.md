@@ -4,12 +4,47 @@ A deterministic, audit-ready agent for diagnosing technical-services faults on
 critical data-center assets (CRAH units, chillers, pumps, UPS). Built for the
 Keppel **AI HARVEST** hackathon.
 
+> **The pitch:** Data-centre faults are diagnosed by a handful of senior
+> technicians — when they retire, that judgement retires with them. TBC turns
+> their know-how into a governed **Intelligence Pill**: an AI drafts structured
+> heuristics from an interview, a *different* knowledge steward approves them,
+> and every later diagnosis reuses that knowledge with the expert's name and
+> verbatim quote attached — under deterministic guardrails, a tamper-evident
+> audit trail, and human-only approval of every action.
+
 > **Design principle: AI in the harvest, determinism in the execution.**
 > An LLM turns expert interviews into draft knowledge (see *Expert Knowledge
 > Capture*), but nothing it drafts goes live until a second knowledge steward
 > approves it. Diagnosis itself is deterministic: the same observation and
 > evidence always yield the same diagnosis, recommendation and guardrail
 > verdict, so every run is auditable and unit-testable.
+
+---
+
+## Quantifiable metrics
+
+**Measured in this repo** (reproduce with `make test` / `make eval` / `GET /kb/stats`):
+
+| Metric | Value |
+|---|---|
+| Test suite | **133 pytest**, all passing, zero configuration |
+| Acceptance evals | **13/13** labelled evals (`make eval`) |
+| Asset classes / fault trees | **4** (CRAH temperature, chiller compressor trip, UPS battery, pump vibration) |
+| Canonical causes | **24** IDs (23 decision-tree causes + 1 `unresolvable` sentinel), one registry |
+| Guardrails | **9** (G1–G9), deterministic, running before any recommendation or work order |
+| Agent lifecycle | **11 states / 16 transitions**, every transition hash-chained (SHA-256) |
+| RBAC | **5 roles, 6 demo users, 33 API endpoints**, enforcement tested server-side |
+| Knowledge governance | **0** knowledge items can go live without a second steward's approval; every KB version rollback-able |
+| Demo tour | **8-step** in-app guided tour + **6-minute** scripted run (`DEMO.md`) |
+
+**Business value — explicitly labelled assumptions, not Keppel data:**
+
+| Metric | Value |
+|---|---|
+| Manual triage without captured knowledge | *assumption:* ≈90 minutes per fault (baseline to be replaced with a measured Keppel figure) |
+| Diagnosis with this pill | seconds, deterministic, with any matching approved expert knowledge shown alongside |
+| Knowledge retention on expert departure | interviews remain as steward-approved, versioned knowledge instead of leaving with the expert |
+| Learning effect, demonstrated | one approved feedback cycle lifts `kb_match` 0.73 → 1.00 and confidence 0.43 → 0.50 on the next identical case (`make demo`, CASE 3; exact numbers depend on mock peer sensors) |
 
 ---
 
@@ -492,7 +527,7 @@ make test        # = PYTHONPATH=. python -m pytest -q tests
 make eval         # = PYTHONPATH=. python3 tests/evals/run_evals.py
 ```
 
-**120 tests** (verified with `make test`; this count is a snapshot — run the
+**133 tests** (verified with `make test`; this count is a snapshot — run the
 command for the current number) across spec acceptance cases, F1-F3
 governance, identity, confidence, contrast/accessibility, and no-contradiction
 checks:

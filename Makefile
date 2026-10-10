@@ -8,7 +8,7 @@ install:  ## Install runtime + test dependencies
 test:  ## Run the repository unit test suite
 	PYTHONPATH=. python -m pytest -q tests
 
-eval:  ## Run EVAL-01..12 acceptance evals and print a pass/fail table
+eval:  ## Run EVAL-01..13 acceptance evals and print a pass/fail table
 	PYTHONPATH=. python3 tests/evals/run_evals.py
 
 demo:  ## Run the end-to-end console demo

@@ -36,7 +36,7 @@ def _declared_capabilities() -> set[str]:
 
 def _enforced_capabilities() -> set[str]:
     """Capabilities actually required by some app.py endpoint via _need()."""
-    app_src = (ROOT / "technical_services_pill" / "app.py").read_text()
+    app_src = (ROOT / "technical_services_pill" / "app.py").read_text(encoding="utf-8")
     return set(_NEED_RE.findall(app_src))
 
 

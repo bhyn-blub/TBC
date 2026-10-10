@@ -3,8 +3,9 @@
 ## Miora's role: DESIGN AGENT (UI/UX + slides)
 
 Miora is **not** a knowledge repository, backend, or diagnostic engine.
-Those are already built and final (WorkBuddy spec → CodeBuddy backend +
-tests + review, R1–R12 fixed, 19 tests passing, 14 endpoints, KB v1.3.0).
+Those were already built and final at this milestone (WorkBuddy spec → CodeBuddy backend +
+tests + review, R1–R12 fixed — 19 tests and 14 endpoints at that point, KB
+v1.3.0). *Current suite: 133 tests, 33 endpoints — see the root `README.md`.*
 
 Miora turns the completed specification into a **coherent, interactive-looking
 UI/UX design** for the Keppel Intelligence Pill demo. It designs how the

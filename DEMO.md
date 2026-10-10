@@ -68,7 +68,7 @@ either way.
 decides anything."
 
 **Do:** On the same Diagnosis screen, scroll to **AI Second Opinion**.
-Point at the "Advisory only — does not affect routing" tag, the
+Point at the "AI hypothesis — advisory only, does not affect routing" tag, the
 agree/disagree badge, and that it's grounded only in evidence actually
 shown above it. If it ever disagrees, point at the G9 guardrail entry
 further down and note the routing didn't change.
@@ -107,12 +107,16 @@ included — see `tests/test_confidence_uplift.py`."
 **Do:** Scroll to **SHA-256 Audit Trace** on Governance. Click **Copy**
 on a hash, point at **Audit Chain Valid**. Mention that changing any
 past entry breaks every hash after it (`tests/test_no_contradictions.py`
-and `EVAL-10` in `make eval` check this directly).
+and `EVAL-10` in `make eval` check this directly). Below it, the
+**Integrity Events** card proves the round-2 "graceful shutdown silently
+overwrites a tamper" gap is closed: a tampered snapshot is archived on
+load or before any overwrite (`EVAL-13`), so the evidence survives clean
+restarts and can't be erased by an autosave.
 
 ---
 
-**If asked "is any of this real?"** — `make test` (pytest, currently 115
-tests), `make eval` (12 labelled acceptance evals, pass/fail table), and
+**If asked "is any of this real?"** — `make test` (pytest, currently 133
+tests), `make eval` (13 labelled acceptance evals, pass/fail table), and
 `make demo` (console walkthrough of the same scenarios, deterministic
 output) all run with zero configuration. Nothing in this script requires
 the Tencent Cloud ADP key; the default `mock` provider runs the same

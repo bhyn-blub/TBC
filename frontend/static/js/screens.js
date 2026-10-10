@@ -390,7 +390,7 @@ export function renderDiagnosis(el, state, h) {
           <div id="ev-body"></div>
         </div></div>
         <div class="card"><div class="card-header"><h3>Decision-Tree Diagnosis</h3></div><div class="card-body">
-          <span class="tier-label tier-fact">Rule-based diagnosis (expert decision tree)</span>
+          <span class="tier-label tier-fact">Deterministic — rule-based diagnosis (expert decision tree)</span>
           <div id="diag-body"></div>
         </div></div>
       </div>`;
@@ -415,7 +415,10 @@ export function renderDiagnosis(el, state, h) {
       </div></div>`;
 
       // Guardrail grid
-      html += `<div class="card"><div class="card-header"><h3>Guardrail Engine (G1-G9)</h3></div><div class="card-body" id="gr-body"></div></div>`;
+      html += `<div class="card"><div class="card-header"><h3>Guardrail Engine (G1-G9)</h3></div><div class="card-body">
+        <span class="tier-label tier-guard">Deterministic guardrails — run before any recommendation or work order</span>
+        <div id="gr-body"></div>
+      </div></div>`;
 
       el.innerHTML = html;
 
@@ -485,7 +488,7 @@ export function renderDiagnosis(el, state, h) {
           );
         }
         aiBody.innerHTML = `
-          <span class="tier-label tier-advisory">Advisory only — does not affect routing</span>
+          <span class="tier-label tier-ai">AI hypothesis — advisory only, does not affect routing</span>
           <div class="flex gap-8 align-center flex-wrap" style="margin:8px 0">
             <span class="badge ${hyp.status === 'unavailable' ? 'badge-red' : 'badge-purple'}">${esc(modelLabel)}</span>
             ${hyp.status === 'ok' ? `<span class="badge ${agrees ? 'badge-green' : 'badge-yellow'}">${agrees ? 'Agrees with rule-based diagnosis' : 'Disagrees with rule-based diagnosis (G9)'}</span>` : ''}
@@ -1036,6 +1039,7 @@ export function renderGovernance(el, state, h) {
     <div class="card" id="rerun-card" hidden><div class="card-header"><h3>Re-run Diagnosis on Similar Open Cases</h3></div><div class="card-body" id="rerun-body"></div></div>
     <div class="card"><div class="card-header"><h3>Rollback</h3></div><div class="card-body" id="rollback-body"></div></div>
     <div class="card"><div class="card-header"><h3>SHA-256 Audit Trace</h3></div><div class="card-body" id="trace-body"></div></div>
+    <div class="card"><div class="card-header"><h3>Integrity Events</h3></div><div class="card-body" id="integrity-body"></div></div>
   `;
 
   // Rollback -- admin only. Lets anyone see the addressable versions even
@@ -1300,9 +1304,29 @@ export function renderGovernance(el, state, h) {
     }
   }
 
+  async function loadIntegrity() {
+    const body = document.getElementById('integrity-body');
+    if (!body) return;
+    try {
+      const data = await api.get('/system/integrity');
+      const events = data.events || [];
+      if (!events.length) {
+        body.innerHTML = `<div class="empty-state"><div class="empty-state-icon">[!]</div><div class="empty-state-title">Clean</div><div class="empty-state-desc">No tamper events detected. Every snapshot written matches what this process last saw, and every audit chain verified on load.</div></div>`;
+        return;
+      }
+      body.innerHTML = `<div class="banner banner-warn" style="margin-bottom:8px"><p><strong>${events.length} integrity event(s) detected</strong> — the tampered snapshot was archived (see paths below) before the clean state overwrote the file, so no restart can erase the evidence.</p></div>
+        <ul style="margin:0 0 0 18px">${events.slice().reverse().map(e => `<li style="margin-bottom:6px"><strong>${esc(e.event)}</strong> — ${esc(e.detail)}${e.archived_path ? ' · <code>' + esc(e.archived_path) + '</code>' : ''}<div class="muted" style="font-size:12px">${esc(e.at)}</div></li>`).join('')}</ul>`;
+    } catch (e) {
+      setHTML('integrity-body', isForbidden(e)
+        ? rbacNote('Integrity events', 'auditors, knowledge stewards and admins')
+        : `<p class="muted">Error: ${esc(e.message)}</p>`);
+    }
+  }
+
   loadStats();
   loadQueue();
   loadTrace();
+  loadIntegrity();
 }
 
 // ═══════════════════════════════════════════════════════════
