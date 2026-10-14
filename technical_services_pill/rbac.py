@@ -14,6 +14,8 @@ Capabilities (string keys):
     approve_knowledge_version — approve a new KnowledgeVersion
     rollback_knowledge_version — roll back to a prior KnowledgeVersion
     read_audit_trail          — read the tamper-evident audit trail
+    revoke_knowledge_version  — withdraw approved knowledge (stewards on their
+                                pills; admin as break-glass)
 """
 from __future__ import annotations
 
@@ -43,15 +45,22 @@ _ALL_CAPABILITIES: frozenset[str] = frozenset(
         "read_audit_trail",
         "capture_expert_knowledge",
         "review_audit_integrity",
+        "open_case",
+        "revoke_knowledge_version",
     }
 )
 
 # Spec §6 RBAC matrix.
 PERMISSIONS: dict[Role, frozenset[str]] = {
-    Role.TECHNICIAN: frozenset({"view_case", "record_outcome"}),
+    # open_case: raise a case and run the agent on it. Reviewers (stewards,
+    # auditors) read cases but never start or drive one.
+    # submit_feedback: the field person tells the stewards what they found;
+    # it is only a proposal until a steward approves it.
+    Role.TECHNICIAN: frozenset({"view_case", "open_case", "record_outcome", "submit_feedback"}),
     Role.ASSET_OPS_MANAGER: frozenset(
         {
             "view_case",
+            "open_case",
             "approve_reject_modify",
             "record_outcome",
             "submit_feedback",
@@ -63,12 +72,19 @@ PERMISSIONS: dict[Role, frozenset[str]] = {
             "view_case",
             "submit_feedback",
             "approve_knowledge_version",
+            "revoke_knowledge_version",
             "read_audit_trail",
             "capture_expert_knowledge",
         }
     ),
     Role.AUDITOR: frozenset({"view_case", "read_audit_trail", "review_audit_integrity"}),
-    Role.ADMIN: _ALL_CAPABILITIES,
+    # Admin runs the system (seeding, asks for rollbacks, break-glass revoke,
+    # drills) but holds no decision that needs a second person: no case
+    # approvals, no knowledge approval or capture, no integrity reviews. A
+    # rollback is countersigned by the pill's steward, so the admin who asks
+    # cannot also decide it.
+    Role.ADMIN: _ALL_CAPABILITIES - {"approve_reject_modify", "review_audit_integrity",
+                                     "approve_knowledge_version", "capture_expert_knowledge"},
 }
 
 

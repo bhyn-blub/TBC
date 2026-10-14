@@ -496,7 +496,10 @@ def _eval_chiller_compressor_trip(
 # (cause ids declared at the top of the module)
 
 _KB_REF_UPS = "kb:technical_services:ups_tree:v1"
-_UPS_THERMAL_ESCALATE_C = 45  # 【ASSUMPTION】 cell temp threshold for runaway risk
+# 【ASSUMPTION】 VRLA cells are rated around 20-25 °C; at 40 °C and still rising
+# the bank is treated as heading for thermal runaway (same line as the G2b
+# hazard read from evidence, guardrails.BATTERY_TEMP_HIGH_C).
+_UPS_THERMAL_ESCALATE_C = 40
 _UPS_SOH_FLOOR = 60  # 【ASSUMPTION】 state-of-health % below which = EoL
 _UPS_AGE_MONTHS_EOL = 60  # 【ASSUMPTION】 5-year design life
 
@@ -505,7 +508,8 @@ def _thermal_runaway_risk(supporting: list[EvidenceItem]) -> DecisionResult:
     return _make_result(
         CAUSE_THERMAL_RUNAWAY_RISK, "Thermal runaway risk (cell temp high + rising)",
         "thermal_shutdown_inspect", "battery_bank",
-        "Reduce float voltage, force-ventilate, isolate bank; safety-critical, do not attempt alone.",
+        "Isolate the battery bank and keep people clear, then force-ventilate the room; "
+        "reduce float voltage only under supervision. Safety-critical: never attempt alone.",
         f"{_KB_REF_UPS}:Q1", supporting,
     )
 
@@ -732,6 +736,43 @@ _FAULT_EVALUATORS: dict[str, object] = {
     "ups_battery_fault": _eval_ups_battery_fault,
     "pump_vibration_high": _eval_pump_vibration_high,
 }
+
+
+# --- Action templates (what an AOM's Modify may pick) ----------------------
+# Every action a fault's tree can recommend, as (type, target, detail). An
+# AOM who disagrees with the agent picks a different one of these for the
+# same fault: the work order only ever carries a reviewed procedure, never
+# free text, so nothing typed into Modify can reach a technician as an
+# instruction. The AOM's reasoning goes in the decision's rationale.
+_FAULT_TERMINALS: dict[str, tuple] = {
+    "temperature_measurement_missing": (
+        _comm_bus_failure, _config_drift, _loose_wiring, _sensor_hardware_failure,
+        _data_path_drop, _intermittent_fault, _sensor_drift, _sensor_fault_noise),
+    "chiller_compressor_trip": (
+        _refrigerant_leak, _low_refrigerant_charge, _condenser_fouling,
+        _compressor_motor_fault, _chiller_electrical_fault),
+    "ups_battery_fault": (
+        _thermal_runaway_risk, _battery_eol, _charger_failure, _ground_fault, _inverter_fault),
+    "pump_vibration_high": (
+        _cavitation, _shaft_misalignment, _foundation_looseness, _bearing_wear,
+        _impeller_imbalance),
+}
+
+
+def action_templates(fault_type: str) -> list[dict[str, str]]:
+    """The actions this fault's tree can recommend, in tree order, without
+    duplicates. Empty for an unknown fault type."""
+    seen: list[dict[str, str]] = []
+    for terminal in _FAULT_TERMINALS.get(fault_type, ()):
+        a = terminal([]).action
+        t = {"type": a.type, "target": a.target, "detail": a.detail}
+        if t not in seen:
+            seen.append(t)
+    return seen
+
+
+def is_action_template(fault_type: str, action_type: str, target: str, detail: str) -> bool:
+    return {"type": action_type, "target": target, "detail": detail} in action_templates(fault_type)
 
 
 # --- Main entry point ------------------------------------------------------

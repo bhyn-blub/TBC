@@ -84,7 +84,7 @@ def test_approving_validated_case_raises_next_identical_case_confidence(client: 
     assert second["confidence_breakdown"]["kb_match"] > first["confidence_breakdown"]["kb_match"]
 
 
-def test_rollback_restores_confidence_exactly(client: TestClient):
+def test_rollback_restores_confidence_exactly(client: TestClient, rollback):
     # Self-contained: compares against its OWN measured baseline, so it
     # doesn't assume a pristine KB (other tests in this session may have
     # already ingested cases with the same fault signature).
@@ -96,8 +96,7 @@ def test_rollback_restores_confidence_exactly(client: TestClient):
     version_after = client.get("/kb/stats", params={"user": "tech1"}).json()["kb_versions"]["CRAH"]
     assert version_after > version_before, "approval must move the KB to a new version"
 
-    resp = client.post(f"/kb/rollback/{version_before}", params={"user": "admin1", "pill": "CRAH", "reason": "test rollback"})
-    assert resp.status_code == 200, resp.text
+    rollback("CRAH", version_before, "test rollback")
 
     restored = _create_and_advance(client)
     assert restored["confidence"] == pytest.approx(confidence_before, abs=1e-9), (
@@ -119,3 +118,18 @@ def test_staleness_uses_real_evidence_age_in_any_timezone():
     later = datetime.now(timezone.utc) + timedelta(minutes=20)
     sensors = [ev for ev in fresh if ev.source == "sensor"]
     assert _staleness_from_age(sensors, now=later) == pytest.approx(20 / 30, abs=0.01)
+
+
+def test_staleness_uses_the_readings_own_timestamp_not_when_it_was_fetched():
+    """A reading fetched just now can still be days old: W4 ages it by its
+    own ``ts``, so a stalled feed is penalised even on a fresh fetch."""
+    from datetime import datetime, timedelta, timezone
+
+    from technical_services_pill.confidence import _staleness_from_age
+    from technical_services_pill.tools import gather_evidence_for_case
+
+    sensors = [ev for ev in gather_evidence_for_case("CRAH-DC1-01", "SA-TEMP-01") if ev.source == "sensor"]
+    assert sensors and _staleness_from_age(sensors) == 0.0  # the mock feed reads as live
+    stale_ts = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+    old = [ev.model_copy(update={"payload": {**ev.payload, "ts": stale_ts}}) for ev in sensors]
+    assert _staleness_from_age(old) == 1.0

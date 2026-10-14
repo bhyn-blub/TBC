@@ -173,3 +173,14 @@ def test_system_info_reports_demo_insecure_flag(secure_client: TestClient, monke
     monkeypatch.setenv("TBC_DEMO_INSECURE", "1")
     resp = secure_client.get("/system/info")
     assert resp.json()["demo_insecure"] is True
+
+
+def test_a_user_seen_before_on_this_browser_still_needs_the_pin():
+    from fastapi.testclient import TestClient
+
+    from technical_services_pill.app import app
+
+    c = TestClient(app)
+    assert c.post("/login", json={"user_id": "steward1", "pin": "3333"}).status_code == 200
+    assert c.post("/login", json={"user_id": "mgr1"}).status_code == 401
+    assert c.get("/login/unlocked").status_code == 404  # the PIN-free resume list is gone

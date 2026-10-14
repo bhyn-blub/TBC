@@ -86,6 +86,8 @@ const rbacNote = (what, roles) => `<div class="banner banner-info"><p><strong>Ro
 // just landed on it (or is watching over a shoulder) knows what to do or
 // expect next without reading the whole card stack first.
 const nextHint = text => `<p class="next-hint">${_esc(text)}</p>`;
+// Who raises the work order depends on the role: a technician is told the AOM does it.
+const workOrderNext = () => (api.can('approve_reject_modify') ? 'raise the work order' : 'the AOM raises the work order');
 
 // local HTML-escape for module-level helper (render functions receive `esc` via helpers)
 function _esc(s) {
@@ -118,6 +120,9 @@ function causeOptions(causes, selected = '') {
 }
 
 const plain = v => String(v || '').replace(/_/g, ' ');
+// What the sensor reported, in words: "invalid" covers a vibration that is
+// too high as much as a temperature that cannot be right.
+const readingText = r => ({ absent: 'no reading', invalid: 'out of range', ok: 'normal' }[r] || r || 'unknown');
 // Model-written prose can carry internal ids ("temperature_measurement_missing");
 // show those words, not the identifier.
 const prose = v => String(v || '').replace(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/g, m => m.replace(/_/g, ' '));
@@ -125,15 +130,19 @@ const prose = v => String(v || '').replace(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/g,
 // reference stays in the tooltip.
 const kbRef = r => {
   const parts = String(r).split(':');
+  // Words for an AOM: "Pump decision tree (v1), question 2", "site heuristic H3".
+  const step = x => x.replace(/^Q(\d+)$/, 'question $1');
   const label = parts.length >= 4
-    ? `${plain(parts[2]).replace(/^\w/, c => c.toUpperCase()).replace(/^(Ups|Crah)\b/, m => m.toUpperCase())} ${parts.slice(3).join(', ')}`
-    : String(r);
+    ? `${plain(parts[2]).replace(/^\w/, c => c.toUpperCase()).replace(/^(Ups|Crah)\b/, m => m.toUpperCase()).replace(/ tree$/, ' decision tree')} (${parts[3]})${parts.length > 4 ? ', ' + parts.slice(4).map(step).join(', ') : ''}`
+    : String(r).replace(/^KB-H(\d+)$/, 'site heuristic H$1').replace(/^KB-(CH|UPS|PMP)(\d+)$/, 'site heuristic $1-$2');
   return `<span class="kb-ref" title="${_esc(r)}">${_esc(label)}</span>`;
 };
-// A symptom is shown after a "When" label; drop the expert's own leading
-// "When"/"If" so it never reads "When When the supply air...".
+// A symptom is shown after a "When" label; drop only a repeated leading
+// "When"/"Whenever" so it never reads "When When the supply air...". Any
+// other wording ("If the axial vibration...") is the expert's own sentence
+// and is shown exactly as they said it.
 const whenText = t => {
-  const s = String(t || '').trim().replace(/^(when|if|whenever)\s+/i, '');
+  const s = String(t || '').trim().replace(/^(when|whenever)\s+/i, '');
   return s.charAt(0).toUpperCase() + s.slice(1);
 };
 
@@ -147,7 +156,7 @@ function decisionFacts(s, esc, confBand) {
   const diag = s.diagnosis || {};
   const cb = confBand(s.confidence, s.current_state);
   const obs = s.observation || {};
-  const abnormal = [`Trigger: ${plain(obs.type)} (reading ${obs.reading_status || 'unknown'})`];
+  const abnormal = [`Trigger: ${plain(obs.type)} (${readingText(obs.reading_status)})`];
   (s.evidence || []).forEach(ev => {
     (ev.abnormal || []).forEach(k => {
       abnormal.push(`${_humaniseKey(k, ev.labels)}: ${_formatValue(k, ev.payload[k], true)}`);
@@ -170,7 +179,7 @@ function corroboration(m, esc) {
     return `<div class="muted" style="margin:4px 0"><span class="badge badge-yellow">Protective device or work on equipment</span> Safety-reviewed by ${esc(m.safety_reviewed_by)}. Guidance for a person only: it never raises confidence.</div>`;
   }
   return m.matched_terms && m.matched_terms.length
-    ? `<div class="muted" style="margin:4px 0"><span class="badge badge-green">Seen in this case's abnormal readings</span> ${m.matched_terms.map(t => `<code>${esc(t)}</code>`).join(' ')}</div>`
+    ? `<div class="muted" style="margin:4px 0"><span class="badge badge-green">Seen in this case's abnormal readings</span> The expert's words ${(() => { const w = m.matched_terms.map(t => `“${esc(t)}”`); return w.length > 1 ? `${w.slice(0, -1).join(', ')} and ${w.at(-1)}` : w[0]; })()} also describe a reading flagged on this case.</div>`
     : `<div class="muted" style="margin:4px 0"><span class="badge badge-grey">Not seen in this case's abnormal readings</span> Shown as guidance; it does not raise confidence.</div>`;
 }
 
@@ -264,7 +273,7 @@ const STAT_FILTERS = [
   { id: 'all',       label: 'Total Cases',       cls: '',            match: () => true },
   { id: 'approval',  label: 'Awaiting Approval', cls: 'stat-yellow', match: c => c.current_state === 'AWAITING_APPROVAL' },
   { id: 'escalated', label: 'Escalated',         cls: 'stat-red',    match: c => c.current_state === 'ESCALATED' },
-  { id: 'resolved',  label: 'Resolved',          cls: 'stat-green',  match: c => c.current_state === 'CLOSED' },
+  { id: 'resolved',  label: 'Resolved',          cls: 'stat-green',  match: c => c.current_state === 'CLOSED' && !c.quarantined },
 ];
 
 // Status sorts in lifecycle order, not alphabetically; an undiagnosed
@@ -287,12 +296,13 @@ export function renderDashboard(el, state, h) {
   const isAdmin = api.role() === 'admin';
 
   el.innerHTML = `
+    <h2 class="sr-only">Cases</h2>
     <div id="integrity-banner"></div>
     <div class="dash-toolbar">
       ${nextHint('click a case to see its diagnosis, or create a new one to get started.')}
       <div class="flex gap-8">
         <button class="btn btn-secondary" id="btn-seed" ${isAdmin ? '' : 'disabled title="Seeding demo cases is limited to the Admin role"'}>Seed Demo Cases</button>
-        <button class="btn btn-primary" id="btn-new">New Case</button>
+        ${api.can('open_case') ? '<button class="btn btn-primary" id="btn-new">New Case</button>' : ''}
       </div>
     </div>
     <div class="stats-row" id="stats-row" role="group" aria-label="Filter cases by status"></div>
@@ -318,16 +328,17 @@ export function renderDashboard(el, state, h) {
           </select>
           <input id="nc-asset-other" type="text" placeholder="e.g. NOPE-999" style="display:none;margin-top:8px">
           </div>
-          <div class="form-group"><label>Sensor ID</label><input id="nc-sensor" type="text" value="SA-TEMP-01" placeholder="e.g. SA-TEMP-01"></div>
+          <div class="form-group"><label for="nc-sensor">Sensor ID</label><select id="nc-sensor"><option value="SA-TEMP-01">SA-TEMP-01</option></select>
+          <input id="nc-sensor-other" type="text" placeholder="e.g. NOPE-SENSOR" aria-label="Sensor ID on the unregistered asset" style="display:none;margin-top:8px"></div>
           <div class="form-group"><label>Fault Type</label><select id="nc-fault">
             <option value="temperature_measurement_missing">temperature measurement missing</option>
             <option value="chiller_compressor_trip">chiller compressor trip</option>
             <option value="ups_battery_fault">ups battery fault</option>
             <option value="pump_vibration_high">pump vibration high</option>
           </select></div>
-          <div class="form-group"><label>Reading Status</label><select id="nc-reading">
-            <option value="absent">absent</option>
-            <option value="invalid">invalid</option>
+          <div class="form-group"><label for="nc-reading">Reading Status</label><select id="nc-reading">
+            <option value="absent">no reading (absent)</option>
+            <option value="invalid">out of range or implausible</option>
           </select></div>
         </div>
         <button class="btn btn-primary" id="btn-create">Create Case</button>
@@ -403,6 +414,10 @@ export function renderDashboard(el, state, h) {
       const [st, sen] = await Promise.all([api.get('/audit/status'), api.get('/sentinel')]);
       if (st.ok && !sen.held.length) return;
       const parts = [];
+      // A tamper recorded on load or save stays open until an auditor
+      // acknowledges it, even though the clean state has been restored.
+      const open = st.unacknowledged_tamper_events || [];
+      if (open.length) parts.push(`${open.length} saved copy change(s) recorded outside the app and not yet acknowledged (latest: ${esc(open[open.length - 1].detail)}; the changed copy was archived and the last verified state restored)`);
       if (sen.held.length) parts.push(`the sentinel stopped ${sen.held.map(x => esc(x.case_id)).join(', ')} (held for an auditor's decision)`);
       if (st.broken_cases.length) parts.push(`case audit chain failed for ${st.broken_cases.map(esc).join(', ')} (frozen: no further actions allowed)`);
       if (!st.ledger_valid) parts.push('the knowledge governance ledger failed verification');
@@ -411,7 +426,8 @@ export function renderDashboard(el, state, h) {
       setHTML('integrity-banner', `<div class="banner banner-error" role="alert"><p><strong>Audit integrity alert:</strong> ${parts.join('; ')}. An auditor reviews it on Governance before anyone relies on it.</p></div>`);
     } catch (_) { /* banner is best-effort */ }
   })();
-  document.getElementById('btn-new').onclick = () => {
+  const btnNew = document.getElementById('btn-new');
+  if (btnNew) btnNew.onclick = () => {
     const f = document.getElementById('new-case-form');
     const opening = f.style.display === 'none';
     f.style.display = opening ? 'block' : 'none';
@@ -430,7 +446,17 @@ export function renderDashboard(el, state, h) {
     const sel = document.getElementById('nc-fault');
     [...sel.options].forEach(o => { o.disabled = !other && (!a || o.value !== a.fault_type); });
     if (a) sel.value = a.fault_type;
-    document.getElementById('nc-sensor').value = a ? a.default_sensor : 'UNKNOWN-SENSOR';
+    // A missing temperature is "no reading"; a trip or a vibration alarm is
+    // a reading out of range.
+    if (a) document.getElementById('nc-reading').value = a.fault_type === 'temperature_measurement_missing' ? 'absent' : 'invalid';
+    // A registered asset offers only its own sensors; the server refuses
+    // any other, so evidence is never filed under the wrong sensor.
+    const sensorSel = document.getElementById('nc-sensor');
+    const sensorOther = document.getElementById('nc-sensor-other');
+    sensorSel.style.display = other ? 'none' : '';
+    sensorOther.style.display = other ? 'block' : 'none';
+    sensorSel.innerHTML = (a ? a.sensors : []).map(sid => `<option value="${esc(sid)}">${esc(sid)}</option>`).join('');
+    if (a) sensorSel.value = a.default_sensor;
   };
   assetSelect.addEventListener('change', syncFault);
   api.get('/assets').then(({ assets }) => {
@@ -446,12 +472,14 @@ export function renderDashboard(el, state, h) {
     try {
       const r = await api.post('/cases', {
         asset_id: assetId,
-        sensor_id: document.getElementById('nc-sensor').value,
+        sensor_id: assetSelect.value === '__other__'
+          ? (document.getElementById('nc-sensor-other').value.trim() || 'UNKNOWN-SENSOR')
+          : document.getElementById('nc-sensor').value,
         observation_type: document.getElementById('nc-fault').value,
         reading_status: document.getElementById('nc-reading').value,
       });
-      showToast(`Case created: ${r.case_id} (${r.evidence_count} evidence items)`, 'success');
-      loadCases();
+      showToast(`Case created: ${r.case_id} (${r.evidence_count} evidence items gathered). Opening it.`, 'success');
+      window.__app__.navigate('diagnosis', r.case_id);
     } catch (e) { showToast(`Error: ${e.message}`, 'error'); }
   };
 
@@ -552,26 +580,51 @@ export function renderDashboard(el, state, h) {
       // Confidence is 0.0 by default before a diagnosis exists -- showing
       // that as a confidence band would read as "Escalate" for a case
       // that was never diagnosed at all, contradicting the status column.
-      const confCell = c.knowledge_withdrawn
+      // A record that failed verification, or that an auditor quarantined,
+      // has no trustworthy score or status: say so instead of showing one.
+      const frozen = c.audit_chain_valid === false || (c.sentinel_hold || {}).active;
+      const untrusted = frozen || c.quarantined;
+      const confCell = untrusted
+        ? `<span class="badge badge-red">${c.quarantined ? 'not trusted (quarantined)' : 'not trusted until reviewed'}</span>`
+        : c.knowledge_withdrawn
         ? `<span class="badge badge-red" title="${esc(c.knowledge_withdrawn)}">${(c.confidence * 100).toFixed(0)}% · knowledge withdrawn</span>`
         : c.diagnosis
         ? (() => {
-            const wasEscalated = (c.history || []).some(x => x.to_state === 'ESCALATED' && x.from_state !== 'ESCALATED');
-            const cb = confBand(c.confidence, wasEscalated ? 'ESCALATED' : c.current_state);
+            // "Escalated" only when the latest diagnosis ended in escalation
+            // (still escalated, or closed from escalation). A case re-diagnosed
+            // and approved since then reads as its current score.
+            const hist = c.history || [];
+            const lastIdx = states => hist.map(x => states.includes(x.to_state)).lastIndexOf(true);
+            const escalatedLast = lastIdx(['ESCALATED']) > lastIdx(['RECOMMENDING', 'AWAITING_APPROVAL']);
+            // Closed from escalation: a person resolved it, so it is not a
+            // live red alarm next to "Resolved".
+            if (escalatedLast && c.current_state === 'CLOSED') return `<span class="badge badge-grey">${(c.confidence * 100).toFixed(0)}% · resolved by an expert</span>`;
+            const cb = confBand(c.confidence, escalatedLast ? 'ESCALATED' : c.current_state);
             return `<span class="badge ${cb.cls}">${cb.label}</span>`;
           })()
         : '<span class="muted">Not yet diagnosed</span>';
-      const canAdv = c.current_state === 'GATHERING_EVIDENCE';
+      const canAdv = c.current_state === 'GATHERING_EVIDENCE' && !untrusted;
+      // The next step for this role, so nobody has to open the case to find it.
+      const next = untrusted ? null
+        : c.current_state === 'AWAITING_APPROVAL' && api.can('approve_reject_modify') ? ['decision', 'Decide']
+        : c.current_state === 'ESCALATED' && api.can('approve_reject_modify') ? ['decision', 'Resolve']
+        : ['MONITORING_OUTCOME', 'RECORDING_OUTCOME'].includes(c.current_state) && api.can('record_outcome') && (c.human_decision || {}).decided_by !== api.user() ? ['outcome', 'Record outcome']
+        : c.current_state === 'EXECUTING' && api.can('approve_reject_modify') ? ['outcome', 'Work order']
+        : null;
       return `<tr class="clickable" tabindex="0" role="link" aria-label="Open case ${c.case_id} on ${c.asset_id}" onclick="window.__app__.navigate('diagnosis', '${c.case_id}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();window.__app__.navigate('diagnosis', '${c.case_id}')}">
         <td><code>${esc(c.case_id)}</code></td>
         <td><strong>${esc(c.asset_id)}</strong></td>
         <td>${esc((obs.type || '-').replace(/_/g, ' '))}</td>
         <td>${esc(obs.sensor_id || '-')}</td>
-        <td>${esc(obs.reading_status || '-')}</td>
-        <td>${statePill(c.current_state)}${(c.sentinel_hold || {}).active ? ' <span class="badge badge-red">Stopped by sentinel</span>' : ''}</td>
+        <td>${esc(obs.reading_status ? readingText(obs.reading_status) : '-')}</td>
+        <td>${c.quarantined ? '<span class="badge badge-red">Quarantined</span>'
+          : c.audit_chain_valid === false ? '<span class="badge badge-red">Frozen: record failed verification</span>'
+          : statePill(c.current_state)}${(c.sentinel_hold || {}).active ? ' <span class="badge badge-red">Stopped by sentinel</span>' : ''}</td>
         <td>${confCell}</td>
         <td onclick="event.stopPropagation()">
-          ${canAdv ? `<button class="btn btn-sm btn-primary" onclick="advCase('${c.case_id}', this)">Advance</button>` : '<span class="muted">-</span>'}
+          ${canAdv && api.can('open_case') ? `<button class="btn btn-sm btn-primary" onclick="advCase('${c.case_id}', this)">Advance</button>`
+            : next ? `<button class="btn btn-sm btn-primary" onclick="window.__app__.navigate('${next[0]}', '${c.case_id}')">${next[1]}</button>`
+            : '<span class="muted">-</span>'}
         </td>
       </tr>`;
     }).join('');
@@ -596,6 +649,14 @@ export function renderDashboard(el, state, h) {
 export function renderDiagnosis(el, state, h) {
   const { api, showToast, statePill, confBand, fmtTime, esc, navigate } = h;
   const cid = state.caseId;
+  // While the agent is diagnosing (possibly started from another screen or
+  // session), poll until it finishes, then re-render: no "refresh" needed.
+  let pollTimer = null;
+  let diagnosingSince = null;
+  const pollWhileDiagnosing = () => {
+    if (pollTimer || state.screen !== 'diagnosis') return;
+    pollTimer = setTimeout(() => { pollTimer = null; if (state.screen === 'diagnosis') load(); }, 2000);
+  };
 
   el.innerHTML = '<div class="card skeleton-card"><div class="skeleton skeleton-line" style="width:30%"></div><div class="skeleton skeleton-line" style="width:50%"></div><div class="skeleton skeleton-line" style="width:80%"></div><div class="skeleton skeleton-line" style="width:40%"></div></div>';
 
@@ -607,14 +668,20 @@ export function renderDiagnosis(el, state, h) {
         api.get('/system/info'),
         loadCauses(),
       ]);
+      if (s.current_state === 'DIAGNOSING') {
+        diagnosingSince = diagnosingSince || Date.now();
+        pollWhileDiagnosing();
+      } else {
+        diagnosingSince = null;
+      }
       const obs = s.observation || {};
       const cb = s.diagnosis ? confBand(s.confidence, s.current_state) : { cls: 'badge-grey', label: 'Not yet diagnosed' };
 
       const nextHintText = (s.audit_chain_valid === false || (s.sentinel_hold || {}).active)
         ? 'this case is frozen: an auditor must review it on Governance.'
         : {
-        GATHERING_EVIDENCE: 'click Advance Agent to run the decision tree.',
-        DIAGNOSING: 'the agent is diagnosing; refresh in a moment.',
+        GATHERING_EVIDENCE: api.can('open_case') ? 'click Advance Agent to run the decision tree.' : 'a technician or AOM runs the agent on this case next.',
+        DIAGNOSING: `the agent is diagnosing (${Math.max(0, Math.floor((Date.now() - (diagnosingSince || Date.now())) / 1000))} s so far). This screen updates when it finishes.`,
         RECOMMENDING: 'a recommendation is being prepared.',
         AWAITING_APPROVAL: s.ledger_valid === false
           ? 'the knowledge ledger failed verification: approval waits for an auditor review on Governance.'
@@ -623,7 +690,7 @@ export function renderDiagnosis(el, state, h) {
           : api.can('approve_reject_modify')
           ? 'move to AOM Decision to approve, reject or modify it.'
           : 'an Asset Operations Manager reviews it on AOM Decision; you can follow it there.',
-        EXECUTING: 'approved: raise the work order on the Outcome screen.',
+        EXECUTING: `approved: ${workOrderNext()} on the Outcome screen.`,
         MONITORING_OUTCOME: 'record the outcome once work is complete, on the Outcome screen.',
         RECORDING_OUTCOME: 'outcome recording is in progress.',
         FEEDBACK_QUEUED: 'feedback is queued for a knowledge steward to review.',
@@ -645,7 +712,7 @@ export function renderDiagnosis(el, state, h) {
             ${statePill(s.current_state)} <span class="badge ${cb.cls}">${cb.label}</span>
           </div>
         </div>
-        <div>${s.current_state === 'GATHERING_EVIDENCE' ? `<button class="btn btn-primary" id="btn-adv">Advance Agent</button>` : ''}</div>
+        <div>${s.current_state === 'GATHERING_EVIDENCE' && api.can('open_case') ? `<button class="btn btn-primary" id="btn-adv">Advance Agent</button>` : ''}</div>
       </div>`;
 
       if (s.knowledge_withdrawn) {
@@ -682,7 +749,7 @@ export function renderDiagnosis(el, state, h) {
       const abnormalCount = evsAll.filter(ev => (ev.abnormal || []).length).length;
       T.evidence += `<div class="grid-2">
         <div class="card"><div class="card-header"><h3>Evidence Timeline</h3><div class="flex align-center gap-8"><span class="muted">${abnormalCount && !_evidenceShowAll ? `${abnormalCount} of ${evsAll.length} abnormal` : `${evsAll.length} items`}</span>${abnormalCount && abnormalCount < evsAll.length ? `<button class="evidence-toggle" id="btn-ev-all">${_evidenceShowAll ? 'Abnormal only' : 'Show all'}</button>` : ''}<button class="evidence-toggle" id="btn-ev-toggle">${_evidenceRawMode ? 'Plain English' : 'Raw JSON'}</button></div></div><div class="card-body">
-          <span class="tier-label tier-fact">Tier 1 - Sensor Observations (Facts)</span>
+          <span class="tier-label tier-fact">Sensor readings (facts)</span>
           <div id="ev-body"></div>
         </div></div>
         <div class="card"><div class="card-header"><h3>Decision-Tree Diagnosis</h3></div><div class="card-body">
@@ -701,7 +768,7 @@ export function renderDiagnosis(el, state, h) {
 
       // Recommendation
       T.summary += `<div class="card"><div class="card-header"><h3>Recommended Action</h3></div><div class="card-body">
-        <span class="tier-label tier-action">Tier 3 - Recommended Action (from approved Intelligence Pill knowledge)</span>
+        <span class="tier-label tier-action">Recommended action (from approved knowledge)</span>
         <div id="rec-body"></div>
       </div></div>`;
 
@@ -715,7 +782,7 @@ export function renderDiagnosis(el, state, h) {
       const hypT = s.ai_hypothesis || {};
       html += tabbed('diag', [
         { id: 'summary', label: 'Summary', html: T.summary || '<div class="banner banner-info"><p>Not yet diagnosed.</p></div>' },
-        { id: 'evidence', label: 'Evidence', note: abnormalCount, html: T.evidence },
+        { id: 'evidence', label: 'Evidence', note: abnormalCount ? `${abnormalCount} abnormal` : '', html: T.evidence },
         { id: 'ai', label: 'AI second opinion', note: hypT.status === 'ok' && hypT.hypothesis && !hypT.agrees_with_rules ? 'disagrees' : '', html: T.ai },
         { id: 'expert', label: 'Expert knowledge', html: T.expert },
         { id: 'scoring', label: 'Scoring', html: T.scoring },
@@ -952,13 +1019,18 @@ export function renderDiagnosis(el, state, h) {
           // and stop a second click starting another advance.
           advBtn.disabled = true;
           advBtn.setAttribute('aria-busy', 'true');
-          advBtn.textContent = 'Gathering evidence and diagnosing…';
+          const started = Date.now();
+          const tick = () => { advBtn.textContent = `Gathering evidence and diagnosing… ${Math.floor((Date.now() - started) / 1000)} s`; };
+          tick();
+          const timer = setInterval(tick, 1000);
           try {
             await thinking(api.post(`/cases/${cid}/advance`));
+            clearInterval(timer);
             showToast('Agent advanced', 'success');
             window.__app__?.refreshSystemInfo?.();
             load();
           } catch (e) {
+            clearInterval(timer);
             showToast(`Error: ${e.message}`, 'error');
             advBtn.disabled = false;
             advBtn.removeAttribute('aria-busy');
@@ -1012,15 +1084,24 @@ export function renderDecision(el, state, h) {
       const decisionHint = (s.audit_chain_valid === false || (s.sentinel_hold || {}).active)
         ? 'this case is frozen: an auditor must review it on Governance.'
         : s.current_state === 'ESCALATED'
-        ? 'resolve the escalation below, or request more evidence to send it back to the agent.'
+        ? (canApprove ? 'resolve the escalation below, or request more evidence to have the agent gather and diagnose it again.'
+                      : 'escalated: an Asset Ops Manager or expert resolves it or requests more evidence.')
         : s.current_state === 'AWAITING_APPROVAL'
-        ? (canApprove ? 'approve, reject or modify sends the case to execution.' : 'an Asset Ops Manager needs to approve, reject or modify this.')
+        ? (!canApprove ? 'an Asset Ops Manager needs to approve, reject or modify this.'
+          : s.knowledge_withdrawn ? (s.ledger_valid === false
+            ? 'knowledge it relied on is withheld until an auditor reviews the ledger; you can still reject.'
+            : 're-score the case against the current knowledge first; you can still reject.')
+          : 'approve or modify to raise a work order, or reject to close the case.')
         : s.current_state === 'EXECUTING'
-        ? 'approved: raise the work order on the Outcome screen.'
+        ? `approved: ${workOrderNext()} on the Outcome screen.`
         : s.current_state === 'MONITORING_OUTCOME'
         ? 'work order raised: record the outcome on the Outcome screen once the work is done.'
         : 'this case has no pending decision right now.';
-      const head = `${nextHint(decisionHint)}<h2 style="font-size:20px;margin-bottom:16px">AOM Decision - ${esc(cid)}</h2>`;
+      // On a projector the controls sit below the fold: one click takes the
+      // AOM straight to them, after the facts at the top of the page.
+      const jump = s.current_state === 'AWAITING_APPROVAL' && canApprove && s.audit_chain_valid !== false && !(s.sentinel_hold || {}).active
+        ? ' <button class="btn btn-primary btn-sm" id="btn-jump-decide">Go to the decision ↓</button>' : '';
+      const head = `${nextHint(decisionHint)}<h2 style="font-size:20px;margin-bottom:16px">AOM Decision - ${esc(cid)}${jump}</h2>`;
       let html = head;
       let expertTab = '';
 
@@ -1042,8 +1123,8 @@ export function renderDecision(el, state, h) {
           ${hazardReason ? `<div class="banner banner-warn" style="margin-bottom:12px"><p><strong>⚠ Safety/environmental hazard:</strong> ${esc(hazardReason.replace(/^\[G2b?\]\s*/, ''))}</p></div>` : ''}
           ${decisionFacts(s, esc, confBand)}`;
         html += `
-          <span class="tier-label tier-action">Tier 3 - Recommended Action (Read-Only)</span>
-          <span class="tier-label tier-human">Tier 4 - Human Decision ${decidedAs ? '(recorded below)' : '(Below)'}</span>`;
+          <span class="tier-label tier-action">Recommended action (read-only)</span>
+          <span class="tier-label tier-human">Your decision ${decidedAs ? '(recorded below)' : '(below)'}</span>`;
         html += s.recommendation.actions.map(a => `
           <div style="display:flex;gap:12px;padding:12px;background:var(--bg-input);border-radius:6px;margin-bottom:8px">
             <span class="badge badge-blue">${esc(plain(a.type))}</span>
@@ -1122,7 +1203,7 @@ export function renderDecision(el, state, h) {
         if (!canApprove) {
           html += `<div class="banner banner-error"><p><strong>Approval Blocked</strong></p><p>You are signed in as ${esc(role)} (${esc(h.roleDisplayName(role))}); that role cannot approve, reject or modify.</p><p>Switch to Asset Operations Manager (mgr1) to approve, reject, or modify.</p></div>`;
         } else {
-          html += `<div class="card"><div class="card-header"><h3>Decision Controls</h3></div><div class="card-body">
+          html += `<div class="card" id="decision-controls"><div class="card-header"><h3>Decision Controls</h3></div><div class="card-body">
             <div class="flex gap-8" style="margin-bottom:16px">
               ${s.knowledge_withdrawn ? '' : '<button class="btn btn-green" id="btn-approve">Approve</button>'}
               <button class="btn btn-red" id="btn-reject">Reject</button>
@@ -1148,7 +1229,10 @@ export function renderDecision(el, state, h) {
         if (!canApprove) {
           escBody.innerHTML = `<p class="muted">Resolving an escalation requires the Asset Ops Manager role. Switch role in the top bar.</p>`;
         } else {
+          const kc = s.knowledge_changed;
           escBody.innerHTML = `
+            ${kc ? `<div class="banner banner-warn" style="margin-bottom:12px"><p><strong>Knowledge has changed since this was scored.</strong> It was scored on ${esc(kc.scored_on)}; ${esc(kc.pill)} is now ${esc(kc.now)}. Re-diagnosing uses the current knowledge.</p>
+              <button class="btn btn-primary mt-16" id="btn-esc-rediag">Re-diagnose against current knowledge</button></div>` : ''}
             <div class="form-group"><label for="esc-reason">Reason or resolution</label><input id="esc-reason" type="text" placeholder="e.g. BMS vendor replaced controller CTL-02; tags reporting again"></div>
             ${s.asset_type === 'UNKNOWN' ? '<p class="muted" style="margin-bottom:8px">This asset is not in the registry, so there is no data source to re-query. Close it with what was found, and register the asset if the pill should cover it.</p>' : ''}
             <div class="form-group"><label for="esc-cause">Confirmed cause (optional: sends this resolution to a knowledge steward so the pill can learn it)</label>
@@ -1158,15 +1242,33 @@ export function renderDecision(el, state, h) {
               <button class="btn btn-red" id="btn-esc-close">Close escalation (resolution required)</button>
             </div>
           `;
+          const btnRe = document.getElementById('btn-esc-rediag');
+          if (btnRe) btnRe.onclick = async () => {
+            btnRe.disabled = true; btnRe.setAttribute('aria-busy', 'true');
+            btnRe.textContent = 'Re-diagnosing against current knowledge… (about 15 s)';
+            try {
+              const r = await thinking(api.post(`/cases/${cid}/escalation/evidence`, { reason: `re-diagnosed against current ${kc.now} knowledge (scored on ${kc.scored_on})` }));
+              showToast(`Re-diagnosed: ${plain(r.current_state).toLowerCase()} at ${Math.round(r.confidence * 100)}%`, 'success');
+              load();
+            } catch (e) {
+              showToast(`Error: ${e.message}`, 'error');
+              btnRe.disabled = false; btnRe.removeAttribute('aria-busy'); btnRe.textContent = 'Re-diagnose against current knowledge';
+            }
+          };
           const btnEv = document.getElementById('btn-esc-evidence');
           if (btnEv) btnEv.onclick = async () => {
             const reason = document.getElementById('esc-reason').value.trim();
             if (!reason) { showToast('Give a reason to request more evidence', 'error'); return; }
+            btnEv.disabled = true; btnEv.setAttribute('aria-busy', 'true');
+            btnEv.textContent = 'Gathering and re-diagnosing… (the AI second opinion can take ~15 s)';
             try {
-              await api.post(`/cases/${cid}/escalation/evidence`, { reason });
-              showToast('More evidence requested; case returned to gathering', 'success');
+              const r = await thinking(api.post(`/cases/${cid}/escalation/evidence`, { reason }));
+              showToast(`Evidence gathered again and re-diagnosed: ${plain(r.current_state).toLowerCase()} at ${Math.round(r.confidence * 100)}%`, 'success');
               load();
-            } catch (e) { showToast(`Error: ${e.message}`, 'error'); }
+            } catch (e) {
+              showToast(`Error: ${e.message}`, 'error');
+              btnEv.disabled = false; btnEv.removeAttribute('aria-busy'); btnEv.textContent = 'Request more evidence (reason required)';
+            }
           };
           document.getElementById('btn-esc-close').onclick = async () => {
             const reason = document.getElementById('esc-reason').value.trim();
@@ -1192,6 +1294,13 @@ export function renderDecision(el, state, h) {
       };
 
       // Wire buttons
+      const btnJump = document.getElementById('btn-jump-decide');
+      if (btnJump) btnJump.onclick = () => {
+        const card = document.getElementById('decision-controls');
+        if (!card) return;
+        card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        (document.getElementById('btn-approve') || document.getElementById('btn-reject'))?.focus({ preventScroll: true });
+      };
       const btnApprove = document.getElementById('btn-approve');
       const btnReject = document.getElementById('btn-reject');
       const btnModify = document.getElementById('btn-modify');
@@ -1223,24 +1332,29 @@ export function renderDecision(el, state, h) {
         };
       }
 
-      function showModifyForm() {
+      async function showModifyForm() {
+        let templates = [];
+        try { templates = (await api.get(`/cases/${cid}/action-templates`)).templates; } catch (e) { /* the server still checks */ }
+        const current = ((s.recommendation || {}).actions || [])[0] || {};
+        const others = templates.filter(t => !(t.type === current.type && t.detail === current.detail));
         setHTML('decision-form', `
-          <div class="form-group"><label>Rationale (required for modify)</label><textarea id="rat-text" placeholder="Explain the modification..."></textarea></div>
-          <div class="grid-2">
-            <div class="form-group"><label>Modified Action Type</label><input id="mod-type" type="text" placeholder="e.g. sensor_replacement"></div>
-            <div class="form-group"><label>Modified Action Target</label><input id="mod-target" type="text" placeholder="e.g. CRAH-DC1-01 / SA-TEMP-01"></div>
-          </div>
-          <div class="form-group"><label>Modified Action Detail</label><input id="mod-detail" type="text" placeholder="e.g. Replace supply-air RTD sensor"></div>
+          <div class="form-group"><label for="rat-text">Rationale (required for modify)</label><textarea id="rat-text" placeholder="Why this procedure instead of the recommended one..."></textarea></div>
+          <p class="muted" style="margin-bottom:8px">Pick another of the procedures this fault's decision tree can recommend. The work order carries that reviewed procedure, never free text, and cites no knowledge. Your reasoning is recorded as the rationale. Anything outside these procedures goes through the site's engineering change process.</p>
+          <div class="form-group"><label for="mod-template">Procedure</label>
+            <select id="mod-template">${others.map((t, i) => `<option value="${i}">${esc(plain(t.type))} · ${esc(plain(t.target))}</option>`).join('')}</select></div>
+          <p class="muted" id="mod-detail-view" style="margin-bottom:8px"></p>
           ${hazardAck()}
-          <button class="btn btn-secondary" id="btn-confirm-modify">Confirm Modification</button>
+          <button class="btn btn-secondary" id="btn-confirm-modify" ${others.length ? '' : 'disabled'}>Confirm Modification</button>
         `);
+        const sel = document.getElementById('mod-template');
+        const showDetail = () => { const t = others[Number(sel.value)]; document.getElementById('mod-detail-view').textContent = t ? `Procedure: ${t.detail}` : 'No other procedure for this fault.'; };
+        sel.onchange = showDetail; showDetail();
         document.getElementById('btn-confirm-modify').onclick = async () => {
           const rat = document.getElementById('rat-text').value.trim();
-          const mt = document.getElementById('mod-type').value.trim();
-          const mtg = document.getElementById('mod-target').value.trim();
-          if (!rat || !mt || !mtg) { showToast('Rationale, type, and target are required', 'error'); return; }
+          const t = others[Number(sel.value)];
+          if (!rat || !t) { showToast('A rationale and a procedure are required', 'error'); return; }
           if (!ackOk()) { showToast('Acknowledge the hazard before modifying', 'error'); return; }
-          try { await api.post(`/cases/${cid}/approval`, { decision: 'modify', hazard_acknowledged: hazardReason ? 'true' : '', rationale: rat, modified_action_type: mt, modified_action_target: mtg, modified_action_detail: document.getElementById('mod-detail').value }); showToast('Modification submitted', 'success'); load(); }
+          try { await api.post(`/cases/${cid}/approval`, { decision: 'modify', hazard_acknowledged: hazardReason ? 'true' : '', rationale: rat, modified_action_type: t.type, modified_action_target: t.target, modified_action_detail: t.detail }); showToast('Modification submitted', 'success'); load(); }
           catch (e) { showToast(`Error: ${e.message}`, 'error'); }
         };
       }
@@ -1277,7 +1391,7 @@ export function renderOutcome(el, state, h) {
         : s.current_state === 'MONITORING_OUTCOME'
         ? 'record the outcome once the work is done.'
         : s.current_state === 'EXECUTING'
-        ? 'raise the work order.'
+        ? `${workOrderNext()}.`
         : 'the outcome is recorded after the AOM approves and a work order is raised.';
       let html = `${nextHint(outcomeHint)}<h2 style="font-size:20px;margin-bottom:16px">Outcome and Feedback - ${esc(cid)}</h2>`;
 
@@ -1300,11 +1414,10 @@ export function renderOutcome(el, state, h) {
       } else if (s.current_state === 'AWAITING_APPROVAL') {
         woBody.innerHTML = '<div class="banner banner-info"><p>Approval required before a work order can be raised.</p></div>';
       } else if (s.current_state === 'EXECUTING' || s.current_state === 'MONITORING_OUTCOME') {
-        const role = api.user();
         const canWO = api.can('approve_reject_modify');
         woBody.innerHTML = canWO
           ? `<button class="btn btn-primary" id="btn-wo">Raise Work Order</button>`
-          : `<div class="banner banner-error"><p><strong>Blocked</strong> - ${esc(role)} (${esc(h.roleDisplayName(role))}) cannot create work orders.</p></div>`;
+          : `<div class="banner banner-info"><p>Only an Asset Ops Manager raises work orders. Ask your AOM to raise it; you record the outcome once the work is under way.</p></div>`;
         const btn = document.getElementById('btn-wo');
         if (btn) btn.onclick = async () => {
           try { await api.post(`/cases/${cid}/work-order`); showToast('Work order created', 'success'); load(); }
@@ -1337,13 +1450,13 @@ export function renderOutcome(el, state, h) {
             ocBody.innerHTML += `<div class="mt-16">
               <h4>Submit Feedback</h4>
               <div class="form-group"><label for="fb-cause">Confirmed Root Cause (${esc(s.asset_type)} causes)</label><select id="fb-cause">${causeOptions(own, s.outcome.root_cause_confirmed || (s.diagnosis && s.diagnosis.top_cause_id) || '')}</select></div>
-              <div class="form-group"><label>Notes</label><textarea id="fb-notes" placeholder="Optional notes..."></textarea></div>
+              <div class="form-group"><label for="fb-notes">What did you find? (goes to the knowledge stewards)</label><textarea id="fb-notes" placeholder="e.g. what you found on site and what you replaced"></textarea></div>
               <button class="btn btn-primary" id="btn-fb">Submit Feedback</button>
             </div>`;
             document.getElementById('btn-fb').onclick = async () => {
               try {
                 const r = await api.postJson(`/cases/${cid}/feedback`, { confirmed_cause: document.getElementById('fb-cause').value, notes: document.getElementById('fb-notes').value });
-                showToast(`Feedback submitted (KB: ${r.kb_cases_total} cases)`, 'success');
+                showToast('Feedback sent to the knowledge stewards. Nothing changes in the knowledge base until a steward approves it.', 'success');
                 load();
               } catch (e) { showToast(`Error: ${e.message}`, 'error'); }
             };
@@ -1352,16 +1465,19 @@ export function renderOutcome(el, state, h) {
           }
         }
       } else if (s.current_state === 'EXECUTING') {
-        ocBody.innerHTML = '<div class="banner banner-info"><p>Raise the work order first. The outcome is recorded once the work is under way.</p></div>';
+        ocBody.innerHTML = `<div class="banner banner-info"><p>${api.can('approve_reject_modify') ? 'Raise the work order first.' : 'The AOM raises the work order first.'} The outcome is recorded once the work is under way.</p></div>`;
       } else if (s.current_state === 'MONITORING_OUTCOME' || s.current_state === 'RECORDING_OUTCOME') {
         const role = api.user();
-        const canRec = api.can('record_outcome');
-        if (canRec) {
+        const approver = (s.human_decision || {}).decided_by;
+        const canRec = api.can('record_outcome') && approver !== role;
+        if (api.can('record_outcome') && approver === role) {
+          ocBody.innerHTML = `<div class="banner banner-warn"><p><strong>Someone else verifies this.</strong> You approved the work, so the technician who did it (or another manager) records whether it worked. Switch to <strong>tech1</strong>.</p></div>`;
+        } else if (canRec) {
           ocBody.innerHTML = `
-            <div class="form-group"><label>Result</label><select id="oc-result"><option value="resolved">resolved</option><option value="partial">partial</option><option value="unresolved">unresolved</option></select></div>
+            <div class="form-group"><label for="oc-result">Result</label><select id="oc-result"><option value="resolved">resolved</option><option value="partial">partial</option><option value="unresolved">unresolved</option></select></div>
             <div class="form-group"><label for="oc-cause">Confirmed Root Cause (${esc(s.asset_type)} causes)</label><select id="oc-cause"><option value="">-- not confirmed --</option>${causeOptions((await loadCauses()).filter(c => c.asset_type === s.asset_type), (s.diagnosis && s.diagnosis.top_cause_id) || '')}</select></div>
             <p class="muted" style="margin-bottom:12px">Verified by: <strong>${esc(role)}</strong> (your signed-in identity is recorded)</p>
-            <div class="form-group"><label>Notes</label><textarea id="oc-notes" placeholder="Optional notes..."></textarea></div>
+            <div class="form-group"><label for="oc-notes">Notes</label><textarea id="oc-notes" placeholder="Optional notes..."></textarea></div>
             <button class="btn btn-primary" id="btn-oc">Record Outcome</button>
           `;
           document.getElementById('btn-oc').onclick = async () => {
@@ -1423,6 +1539,7 @@ export function renderGovernance(el, state, h) {
   const { api, showToast, statePill, confBand, fmtTime, esc, navigate } = h;
 
   el.innerHTML = `
+    <h2 class="sr-only">Governance</h2>
     ${nextHint(api.role() === 'knowledge_steward'
       ? 'approve pending proposals to bump the KB version, then re-run affected cases to see the uplift.'
       : api.can('review_audit_integrity')
@@ -1451,40 +1568,67 @@ export function renderGovernance(el, state, h) {
     ], api.role() === 'knowledge_steward' ? 'review' : api.can('review_audit_integrity') ? 'audit' : 'overview')}
   `;
 
-  // Rollback -- admin only, one pill at a time. Lets anyone see the
-  // addressable versions even if they can't act on them, so the mapping from
-  // "CRAH v1.4.0" on screen to the integer /kb/rollback/{N} takes is never a guess. A named function
-  // (not a fire-and-forget IIFE) so an approval/rejection elsewhere on this
-  // same screen can refresh it too -- otherwise it shows a stale "current".
+  // Rollback is two-person. An admin asks, for one pill at a time; nothing
+  // changes until that pill's steward countersigns. Anyone can see the
+  // addressable versions and the requests, so the mapping from "CRAH v1.4.0"
+  // on screen to the integer /kb/rollback/{N} takes is never a guess.
+  // Named so approvals and rollbacks elsewhere on this screen refresh it.
   async function loadRollback() {
     const body = document.getElementById('rollback-body');
     if (!body) return;
-    const role = api.user();
-    const canRollback = api.can('rollback_knowledge_version');
+    const canAsk = api.can('rollback_knowledge_version');
+    // Only a knowledge steward can countersign; the server checks the pill too.
+    const canCountersign = api.role() === 'knowledge_steward';
+    const me = api.user();
     const pill = loadRollback.pill || 'CRAH';
     try {
-      const { versions, current_version, current_label } = await api.get(`/kb/versions?pill=${encodeURIComponent(pill)}`);
+      const [{ versions, current_version, current_label }, { requests }] = await Promise.all([
+        api.get(`/kb/versions?pill=${encodeURIComponent(pill)}`), api.get('/kb/rollback-requests')]);
       const targets = versions.filter(v => v.status === 'live' && v.version !== current_version);
       const options = targets.map(v => `<option value="${v.version}" data-label="${esc(v.label)}">v${esc(v.label)}</option>`).join('');
       const pillPicker = `<div class="flex gap-8 align-center" style="margin-bottom:10px"><label for="rb-pill" class="role-label">Pill</label>
         <select id="rb-pill">${['CRAH', 'Chiller', 'UPS', 'Pump'].map(p => `<option${p === pill ? ' selected' : ''}>${p}</option>`).join('')}</select></div>`;
       const history = versions.map(v => `<span class="badge ${v.status === 'live' ? (v.version === current_version ? 'badge-green' : 'badge-blue') : 'badge-grey'}" style="margin:2px" title="${v.status === 'live' ? 'live lineage' : 'rolled back; this label is never reused'}">v${esc(v.label)}${v.version === current_version ? ' (current)' : v.status === 'rolled_back' ? ' (rolled back)' : ''}</span>`).join(' ');
-      body.innerHTML = `
-        ${pillPicker}
-        <p class="muted" style="margin-bottom:8px">Current ${esc(pill)} knowledge: <strong>${esc(current_label)}</strong>. Rolling back one pill leaves the others alone. Version labels are never reused: a rolled-back version keeps its label and the next approval gets a new one.</p>
-        <div style="margin-bottom:12px">${history}</div>
-        ${!canRollback ? `<p class="muted">Rolling back requires the Admin role. Switch role in the top bar to see the control.</p>`
-          : !targets.length ? `<p class="muted">Nothing to roll back to: the current version is the only live one.</p>` : `
-          <div class="flex gap-8 flex-wrap align-center">
+      const mine = requests.filter(r => r.pill === pill);
+      const pending = mine.filter(r => r.status === 'pending');
+      const askForm = !canAsk ? `<p class="muted">Only an Admin asks for a rollback. The ${esc(pill)} steward then countersigns it, and nothing changes until they do.</p>`
+        : !targets.length ? `<p class="muted">Nothing to roll back to: the current version is the only live one.</p>`
+        : pending.length ? `<p class="muted">A rollback of ${esc(pill)} is already waiting for ${esc(pending[0].countersigned_by)}.</p>`
+        : `<div class="flex gap-8 flex-wrap align-center">
             <label for="rb-version" class="role-label">Roll back to</label>
             <select id="rb-version">${options}</select>
             <input id="rb-reason" type="text" placeholder="Reason (required, recorded in the ledger)" style="flex:1 1 260px">
-            <button class="btn btn-red btn-sm" id="rb-go">Roll back…</button>
+            <button class="btn btn-red btn-sm" id="rb-go">Ask for rollback…</button>
           </div>
-          <div id="rb-confirm" class="banner banner-warn mt-16" hidden></div>
-        `}
-      `;
+          <div id="rb-confirm" class="banner banner-warn mt-16" hidden></div>`;
+      const cards = mine.slice(-4).reverse().map(r => {
+        const pr = r.preview || {};
+        const what = `Would remove ${pr.validated_cases || 0} validated case(s), ${pr.expert_heuristics || 0} expert heuristic(s)`
+          + `${(pr.proposals || []).length ? `, and make ${esc((pr.proposals || []).join(', '))} rolled back` : ''}.`;
+        const head = `<strong>${esc(r.request_id)}</strong>: roll back to ${esc(r.target_label)}, asked by ${esc(r.requested_by)}. <span class="muted">“${esc(r.reason)}”</span>`;
+        if (r.status === 'countersigned') return `<div class="banner banner-success mt-16"><p>${head} <strong>Countersigned by ${esc(r.decided_by)}; rolled back.</strong></p></div>`;
+        if (r.status === 'rejected') return `<div class="banner banner-warn mt-16"><p>${head} <strong>Refused by ${esc(r.decided_by)}:</strong> “${esc(r.decision_reason)}”. Nothing changed.</p></div>`;
+        if (canCountersign && r.countersigned_by === me) return `<div class="card mt-16"><div class="card-body">
+            <p>${head}</p><p class="muted" style="margin:6px 0"><strong>Nothing has changed yet.</strong> ${esc(what)}</p>
+            <div class="flex gap-8 flex-wrap align-center">
+              <input id="cs-reason-${esc(r.request_id)}" type="text" placeholder="Reason for refusing (only if you refuse)" style="flex:1 1 240px">
+              <button class="btn btn-red btn-sm" data-cs="${esc(r.request_id)}">Countersign rollback</button>
+              <button class="btn btn-secondary btn-sm" data-rf="${esc(r.request_id)}">Refuse</button>
+            </div></div></div>`;
+        return `<div class="banner banner-info mt-16"><p>${head} <strong>Waiting for ${esc(r.countersigned_by)} to countersign.</strong> Nothing has changed yet. ${esc(what)}</p></div>`;
+      }).join('');
+      // Rollbacks waiting for the signed-in steward, whichever pill is on screen.
+      const waitingForMe = requests.filter(r => r.status === 'pending' && r.countersigned_by === me && canCountersign);
+      const waitingBanner = waitingForMe.map(r => `<div class="banner banner-warn" style="margin-bottom:10px"><p><strong>${esc(r.request_id)} waits for you:</strong> roll ${esc(r.pill)} back to ${esc(r.target_label)}, asked by ${esc(r.requested_by)}. <button class="btn btn-secondary btn-sm" data-open-pill="${esc(r.pill)}">Open ${esc(r.pill)}</button></p></div>`).join('');
+      body.innerHTML = `
+        ${waitingBanner}
+        ${pillPicker}
+        <p class="muted" style="margin-bottom:8px">Current ${esc(pill)} knowledge: <strong>${esc(current_label)}</strong>. Rolling back one pill leaves the others alone. Version labels are never reused: a rolled-back version keeps its label and the next approval gets a new one.</p>
+        <div style="margin-bottom:12px">${history}</div>
+        ${askForm}
+        ${cards}`;
       document.getElementById('rb-pill').onchange = (ev) => { loadRollback.pill = ev.target.value; loadRollback(); };
+      body.querySelectorAll('[data-open-pill]').forEach(b => b.onclick = () => { loadRollback.pill = b.dataset.openPill; loadRollback(); });
       const go = document.getElementById('rb-go');
       if (go) {
         go.onclick = () => {
@@ -1494,18 +1638,34 @@ export function renderGovernance(el, state, h) {
           const label = sel.selectedOptions[0].dataset.label;
           const box = document.getElementById('rb-confirm');
           box.hidden = false;
-          box.innerHTML = `<p><strong>Roll ${esc(pill)} knowledge back from ${esc(current_label)} to v${esc(label)}?</strong> Every ${esc(pill)} case and expert heuristic approved after v${esc(label)} stops being used; other pills are not touched. This is recorded in the ledger with your reason.</p>
-            <div class="flex gap-8 mt-16"><button class="btn btn-red btn-sm" id="rb-yes">Yes, roll back</button><button class="btn btn-secondary btn-sm" id="rb-no">Cancel</button></div>`;
+          box.innerHTML = `<p><strong>Ask for ${esc(pill)} to go back from ${esc(current_label)} to v${esc(label)}?</strong> Nothing changes yet. The ${esc(pill)} steward must countersign it, and will see exactly what would be removed. Other pills are not touched.</p>
+            <div class="flex gap-8 mt-16"><button class="btn btn-red btn-sm" id="rb-yes">Yes, ask for rollback</button><button class="btn btn-secondary btn-sm" id="rb-no">Cancel</button></div>`;
           document.getElementById('rb-no').onclick = () => { box.hidden = true; };
           document.getElementById('rb-yes').onclick = async () => {
             try {
               const r = await api.post(`/kb/rollback/${sel.value}`, { pill, reason });
-              showToast(`${pill} rolled back to v${label} (${r.removed_cases} item(s) removed)`, 'success');
-              refreshAll();
+              showToast(`${r.request.request_id} sent to ${r.countersigned_by} to countersign`, 'success');
+              loadRollback();
             } catch (e) { showToast(`Error: ${e.message}`, 'error'); }
           };
         };
       }
+      body.querySelectorAll('[data-cs]').forEach(b => b.onclick = async () => {
+        try {
+          const r = await api.post(`/kb/rollback-requests/${b.dataset.cs}/countersign`, { reason: 'agreed' });
+          showToast(`${r.request_id} countersigned: ${pill} rolled back`, 'success');
+          refreshAll();
+        } catch (e) { showToast(`Error: ${e.message}`, 'error'); }
+      });
+      body.querySelectorAll('[data-rf]').forEach(b => b.onclick = async () => {
+        const reason = (document.getElementById(`cs-reason-${b.dataset.rf}`) || {}).value?.trim();
+        if (!reason) { showToast('Give a reason for refusing', 'error'); return; }
+        try {
+          await api.post(`/kb/rollback-requests/${b.dataset.rf}/reject`, { reason });
+          showToast(`${b.dataset.rf} refused. Nothing changed.`, 'success');
+          loadRollback();
+        } catch (e) { showToast(`Error: ${e.message}`, 'error'); }
+      });
     } catch (e) {
       body.innerHTML = `<p class="muted">Error: ${esc(e.message)}</p>`;
     }
@@ -1538,6 +1698,10 @@ export function renderGovernance(el, state, h) {
 
   // Approved proposals, each revocable on its own: withdrawing one bad
   // item should not require rolling back everything approved after it.
+  // A proposal filed under several pills can be withdrawn one pill at a
+  // time, so each pill's steward withdraws their own part.
+  const livePills = p => Object.keys(p.kb_version_labels || p.kb_versions || {})
+    .filter(x => !(p.rolled_back_pills || []).includes(x) && !(p.revoked_pills || []).includes(x));
   async function loadApproved() {
     const body = document.getElementById('approved-body');
     if (!body) return;
@@ -1563,7 +1727,8 @@ export function renderGovernance(el, state, h) {
             : `${p.kind === 'escalation_resolution' ? 'Escalation resolution' : 'Outcome feedback'}: ${esc(causeLabel(p.confirmed_cause))} · ${esc(p.case_id)}`;
           return `<div class="rerun-row">
             <div><code>${pid}</code> ${what} <span class="muted">· approved by ${esc(p.decided_by)} · ${esc(Object.entries(p.kb_version_labels || {}).map(([k, v]) => `${k} v${v}`).join(', '))}</span></div>
-            <div class="flex gap-8"><input id="rv-reason-${pid}" type="text" placeholder="Reason (required)" style="min-width:200px">
+            <div class="flex gap-8"><input id="rv-reason-${pid}" type="text" placeholder="Reason (required)" aria-label="Reason for revoking ${pid}" style="min-width:200px">
+            ${livePills(p).length > 1 ? `<select id="rv-pill-${pid}" aria-label="Which part to revoke"><option value="">All pills</option>${livePills(p).map(x => `<option value="${esc(x)}">${esc(x)} part only</option>`).join('')}</select>` : ''}
             <button class="btn btn-red btn-sm" id="rv-go-${pid}">Revoke</button></div>
           </div>`;
         }).join('');
@@ -1573,8 +1738,9 @@ export function renderGovernance(el, state, h) {
           const reason = document.getElementById(`rv-reason-${p.proposal_id}`).value.trim();
           if (!reason) { showToast('Give a reason for revoking', 'error'); return; }
           try {
-            const r = await api.post(`/kb/proposals/${p.proposal_id}/revoke`, { reason });
-            showToast(`${p.proposal_id} revoked (${r.removed_items} item(s) withdrawn)`, 'success');
+            const pill = document.getElementById(`rv-pill-${p.proposal_id}`)?.value || '';
+            const r = await api.post(`/kb/proposals/${p.proposal_id}/revoke`, pill ? { reason, pills: pill } : { reason });
+            showToast(`${p.proposal_id}${pill ? ` (${pill} part)` : ''} revoked (${r.removed_items} item(s) withdrawn)`, 'success');
             refreshAll();
           } catch (e) { showToast(`Error: ${e.message}`, 'error'); }
         };
@@ -1595,7 +1761,8 @@ export function renderGovernance(el, state, h) {
   // Integrity review: the way out of "frozen until an auditor reviews it".
   // An auditor records a disposition for each chain that fails verification:
   // accept it as genuine (re-signed, with the review on the chain and in the
-  // ledger) or, for a case, quarantine it (closed; redo the work as a new case).
+  // ledger), for a case quarantine it (closed; redo the work as a new case),
+  // or for the ledger restore the last knowledge base it verified.
   const auditNeeds = { integrity: false, sentinel: false };
   const noteAudit = () => setTabNote('gov', 'audit', auditNeeds.integrity || auditNeeds.sentinel ? 'action needed' : '');
 
@@ -1605,10 +1772,12 @@ export function renderGovernance(el, state, h) {
     if (!card || !body) return;
     try {
       const st = await api.get('/audit/status');
+      // The ledger comes first: the server records every other review in it,
+      // so it must be reviewed before anything else.
       const items = [
-        ...st.broken_cases.map(cid => ({ target: `case:${cid}`, label: `Case ${cid}: its audit chain failed verification; the case is frozen.`, quarantine: true })),
-        ...(st.ledger_valid ? [] : [{ target: 'ledger', label: `Knowledge ledger: ${st.ledger_problem || 'failed verification'}. Knowledge changes are frozen and expert knowledge is withheld from diagnoses. Review this first: every other review is recorded in the ledger.` }]),
-        ...(st.registry_valid ? [] : [{ target: 'registry', label: 'Case registry: a case was added or removed outside the app.' }]),
+        ...(st.ledger_valid ? [] : [{ target: 'ledger', restore: true, label: `Knowledge ledger: ${st.ledger_problem || 'failed verification'}. Knowledge changes are frozen and expert knowledge is withheld from diagnoses. Review this first: every other review is recorded in the ledger.` }]),
+        ...st.broken_cases.map(cid => ({ target: `case:${cid}`, label: `Case ${cid}: ${(st.case_problems || {})[cid] || 'its audit chain failed verification'}. The case is frozen.`, quarantine: true })),
+        ...(st.registry_valid ? [] : [{ target: 'registry', label: `Case registry: a case was added or removed outside the app.${(st.missing_cases || []).length ? ` Missing: ${st.missing_cases.join(', ')} (opened according to the signed tool log, no longer stored).` : ''}` }]),
         ...(st.tool_log_valid ? [] : [{ target: 'tool_log', label: 'Tool log: entries were changed or removed.' }]),
       ];
       card.hidden = !items.length;
@@ -1618,12 +1787,13 @@ export function renderGovernance(el, state, h) {
         body.innerHTML = `<p>${items.map(i => esc(i.label)).join('<br>')}</p><p class="muted">An auditor (auditor1) reviews these and records a decision.</p>`;
         return;
       }
-      body.innerHTML = `<p class="muted" style="margin-bottom:10px">Investigate first (Case Audit Trace below, the snapshot and server logs). <strong>Accept</strong> means the record is genuine as it stands: it is re-signed, and your review is written to the chain and the ledger. <strong>Quarantine</strong> closes a case whose record you do not trust; redo the work as a new case.</p>` +
+      body.innerHTML = `<p class="muted" style="margin-bottom:10px">Investigate first (Case Audit Trace below, the snapshot and server logs). <strong>Accept</strong> means the record is genuine as it stands: it is re-signed, and your review is written to the chain and the ledger. <strong>Quarantine</strong> closes a case whose record you do not trust; redo the work as a new case. <strong>Restore</strong> puts back the last knowledge base the ledger verified, discarding the change made outside governance.</p>` +
         items.map((i, n) => `<div class="rerun-row">
           <div>${esc(i.label)}</div>
           <div class="flex gap-8 flex-wrap"><input id="ir-reason-${n}" type="text" placeholder="What you checked (required)" style="min-width:220px">
             <button class="btn btn-secondary btn-sm" id="ir-accept-${n}">Accept</button>
-            ${i.quarantine ? `<button class="btn btn-red btn-sm" id="ir-quarantine-${n}">Quarantine</button>` : ''}</div>
+            ${i.quarantine ? `<button class="btn btn-red btn-sm" id="ir-quarantine-${n}">Quarantine</button>` : ''}
+            ${i.restore ? `<button class="btn btn-red btn-sm" id="ir-restore-${n}">Restore last verified</button>` : ''}</div>
         </div>`).join('');
       items.forEach((i, n) => {
         const go = async decision => {
@@ -1631,13 +1801,15 @@ export function renderGovernance(el, state, h) {
           if (!reason) { showToast('Record what you checked before deciding', 'error'); document.getElementById(`ir-reason-${n}`).focus(); return; }
           try {
             await api.post('/audit/review', { target: i.target, decision, reason });
-            showToast(`${i.target.replace('case:', 'Case ')} ${decision === 'accept' ? 'accepted' : 'quarantined'}; recorded in the ledger`, 'success');
+            showToast(`${i.target.replace('case:', 'Case ')} ${{ accept: 'accepted', quarantine: 'quarantined', restore: 'restored to the last verified snapshot' }[decision]}; recorded in the ledger`, 'success');
             refreshAll();
           } catch (e) { showToast(`Error: ${e.message}`, 'error'); }
         };
         document.getElementById(`ir-accept-${n}`).onclick = () => go('accept');
         const q = document.getElementById(`ir-quarantine-${n}`);
         if (q) q.onclick = () => go('quarantine');
+        const rs = document.getElementById(`ir-restore-${n}`);
+        if (rs) rs.onclick = () => go('restore');
       });
     } catch (e) { card.hidden = true; }
   }
@@ -1676,15 +1848,20 @@ export function renderGovernance(el, state, h) {
         if (rel) rel.onclick = () => go('release');
         const q = document.getElementById(`sn-quarantine-${n}`);
         if (q) q.onclick = () => go('quarantine');
+        const rs = document.getElementById(`ir-restore-${n}`);
+        if (rs) rs.onclick = () => go('restore');
       });
       const drill = document.getElementById('sn-drill');
       if (drill) drill.onclick = async () => {
         drill.disabled = true;
+        drill.setAttribute('aria-busy', 'true');
+        drill.textContent = 'Drill running… the AI second opinion can take ~10 s';
         try {
           const r = await thinking(api.post('/sentinel/drill'));
           showToast(`Drill: the sentinel stopped ${r.case_id}`, r.held ? 'success' : 'error');
           refreshAll();
-        } catch (e) { showToast(`Error: ${e.message}`, 'error'); drill.disabled = false; }
+        } catch (e) { showToast(`Error: ${e.message}`, 'error'); drill.disabled = false; drill.textContent = 'Run a sentinel drill'; }
+        drill.removeAttribute('aria-busy');
       };
     } catch (e) {
       body.innerHTML = `<p class="muted">Error: ${esc(e.message)}</p>`;
@@ -1703,6 +1880,7 @@ export function renderGovernance(el, state, h) {
   `);
 
   // Knowledge queue — load real pending proposals
+  let queueShown = false;
   async function loadQueue() {
     const qb = document.getElementById('queue-body');
     if (!qb) return;
@@ -1714,6 +1892,12 @@ export function renderGovernance(el, state, h) {
       const data = await api.get('/kb/queue');
       const queue = data.queue || [];
       setTabNote('gov', 'review', queue.length ? String(queue.length) : '');
+      // A steward with something to decide lands on the queue, whichever
+      // tab they last had open (once per visit, so it never yanks them back).
+      if (!queueShown && api.role() === 'knowledge_steward' && queue.some(p => p.submitted_by !== api.user())) {
+        queueShown = true;
+        window.__tabs__.open('gov', 'review');
+      }
       if (!queue.length) {
         qb.innerHTML = `<div class="empty-state"><div class="empty-state-icon">[ ]</div><div class="empty-state-title">No pending proposals</div><div class="empty-state-desc">Expert interviews from the Capture screen and feedback on closed cases appear here for review by a second steward.</div></div>`;
         return;
@@ -1734,7 +1918,7 @@ export function renderGovernance(el, state, h) {
           ${lines('Check', x.checks)}${lines('Never', x.do_not)}${lines('Escalate when', x.escalate_when)}
           <div class="q-quote">"${esc(x.evidence_quote)}"</div></li>`;
       const describe = p => p.kind === 'expert_capture'
-        ? `<div class="q-title"><strong>${esc(p.proposal_id)}</strong> <span class="badge badge-purple">Expert interview</span></div>
+        ? `<div class="q-title"><strong>${esc(p.proposal_id)}</strong> <span class="badge badge-purple">Expert interview</span>${p.duplicate_of ? ` <span class="badge badge-yellow">Copy: same words as ${esc(p.duplicate_of)}</span>` : ''}</div>
             <div class="q-meta">${esc(p.expert_name)}, ${esc(p.expert_role)} · ${(p.heuristics || []).length} heuristic(s) · ${esc({ adp: 'drafted by Tencent Cloud ADP', mock: 'drafted by the offline models', manual: 'entered by hand' }[p.provider] || p.provider)}, reviewed by ${esc(p.submitted_by)}${p.expert_consent ? ' · expert consent recorded' : ''}</div>
             <ul class="q-list">${(p.heuristics || []).map(heuristicLine).join('')}</ul>`
         : p.kind === 'escalation_resolution'
@@ -1745,23 +1929,33 @@ export function renderGovernance(el, state, h) {
             <div class="q-meta">Confirmed cause: <strong>${esc(causeLabel(p.confirmed_cause))}</strong> · Case ${esc(p.case_id)} · ${esc(p.asset_id)} · submitted by ${esc(p.submitted_by)}</div>`;
       qb.innerHTML = queue.map(p => {
         const own = p.submitted_by === me;
-        // Mirrors the server rule: only a knowledge steward decides; the
-        // pill's owner does, and the other steward stands in only when the
-        // owner proposed it. Admin can view, revoke and roll back, not decide.
+        // Mirrors the server rule: only a knowledge steward decides, pill by
+        // pill; each pill's owner decides it, and another steward stands in
+        // only when the owner proposed it. Admin can view, revoke and roll
+        // back, not decide.
+        const waiting = p.awaiting_signoff || [];
+        const decides = w => (w.owner && w.owner !== p.submitted_by) ? w.owner === me : me !== p.submitted_by;
+        const mine = waiting.filter(decides).map(w => w.pill);
         const notSteward = api.role() !== 'knowledge_steward';
-        const notOwner = !own && p.owner_steward && p.owner_steward !== me && p.owner_steward !== p.submitted_by;
+        const notOwner = !own && !mine.length;
         const blocked = own || notSteward || notOwner;
         const why = notSteward ? 'Only a knowledge steward decides on knowledge.'
           : own ? 'You sent this. A different steward must decide.'
-          : `${esc(p.asset_type)} knowledge is owned by ${esc(p.owner_steward)}; they decide.`;
+          : `Waiting for ${waiting.map(w => `${esc(w.pill)} (${esc(w.owner || 'any other steward')})`).join(', ')}; you don't decide those pills.`;
+        const signed = Object.entries(p.signoffs || {});
+        const signLine = (signed.length || waiting.length > 1)
+          ? `<div class="q-signoff">Each pill's steward signs off: ${[
+              ...signed.map(([pill, s]) => `<span class="badge badge-green">${esc(pill)} ✓ ${esc(s.by)}</span>`),
+              ...waiting.map(w => `<span class="badge badge-grey">${esc(w.pill)} · waiting for ${w.owner ? esc(w.owner) : `a steward other than ${esc(p.submitted_by)}${w.stand_in ? ' (the owner proposed it)' : ''}`}</span>`),
+            ].join(' ')}</div>` : '';
         // Every check, and every line about a protective device, needs the
         // approver's explicit safety review (learning.needs_safety_review).
         const held = [...new Set((p.heuristics || []).flatMap(h => [...(h.checks || []), ...(h.safety_review || [])]))];
         const pid = esc(p.proposal_id);
         return `<div class="card q-card" style="margin-bottom:8px">
-          <div class="q-body">${describe(p)}</div>
+          <div class="q-body">${describe(p)}${signLine}</div>
           <div class="q-actions">
-            <button class="btn btn-green btn-sm" id="approve-${pid}" ${blocked ? 'disabled aria-describedby="own-' + pid + '"' : ''}>Approve…</button>
+            <button class="btn btn-green btn-sm" id="approve-${pid}" ${blocked ? 'disabled aria-describedby="own-' + pid + '"' : ''}>${!blocked && mine.length < waiting.length ? `Sign off ${esc(mine.join(', '))}…` : 'Approve…'}</button>
             <button class="btn btn-red btn-sm" id="reject-${pid}" ${blocked ? 'disabled' : ''}>Reject…</button>
             ${blocked ? `<div class="q-own" id="own-${pid}">${why}</div>` : ''}
             <div class="q-reject" id="ap-${pid}" hidden>
@@ -1794,7 +1988,11 @@ export function renderGovernance(el, state, h) {
           if (safety && !safety.checked) { showToast('Confirm the safety review of the lines about protective devices', 'error'); safety.focus(); return; }
           try {
             const r = await api.post(`/kb/proposals/${id}/approve`, { rationale, safety_reviewed: safety ? 'true' : '' });
-            showToast(`${id} approved: now live as ${(r.kb_version_labels || []).join(', ') || 'new knowledge'}`, 'success');
+            if (r.status === 'awaiting_signoff') {
+              showToast(`${id}: you signed off ${r.signed_for.join(', ')}. Not live yet; waiting for ${r.awaiting_signoff.map(w => `${w.pill} (${w.owner || 'another steward'})`).join(', ')}.`, 'success');
+            } else {
+              showToast(`${id} approved: now live as ${(r.kb_version_labels || []).join(', ') || 'new knowledge'}`, 'success');
+            }
             refreshAll();
           } catch (e) { showToast(`Error: ${e.message}`, 'error'); }
         };
@@ -1840,7 +2038,7 @@ export function renderGovernance(el, state, h) {
         return;
       }
       body.innerHTML = `
-        <p class="muted" style="margin-bottom:10px">Open cases diagnosed with what was just approved. Re-run shows what the new knowledge changes, without touching the case.</p>
+        <p class="muted" style="margin-bottom:10px">Open cases diagnosed with what was just approved. Re-run shows what the new knowledge alone changes, without touching the case.</p>
         ${matches.map(m => `
           <div class="rerun-row" id="rerun-row-${esc(m.case_id)}">
             <div><code>${esc(m.case_id)}</code> <span class="muted">${esc(m.asset_id)} · ${esc(causeLabel(m.cause))} · ${esc(plain(m.current_state).toLowerCase())}</span></div>
@@ -1862,7 +2060,8 @@ export function renderGovernance(el, state, h) {
             const crosses = preview.before < 0.55 && preview.after >= 0.55;
             document.getElementById(`rerun-result-${m.case_id}`).innerHTML =
               ` <span class="badge ${up ? 'badge-green' : 'badge-grey'}">${before}% &rarr; ${after}%</span>` +
-              (crosses ? ` <span class="muted">now clears the 55% recommendation threshold${m.current_state === 'ESCALATED' ? '; on AOM Decision, "Request more evidence" re-diagnoses it with this knowledge' : ''}</span>` : '');
+              (crosses ? ` <span class="muted">now clears the 55% recommendation threshold${m.current_state === 'ESCALATED' ? '; on AOM Decision, "Request more evidence" re-diagnoses it with this knowledge' : ''}</span>` : '') +
+              (Math.abs(preview.evidence_age_effect || 0) >= 0.005 ? ` <span class="muted">(effect of the knowledge only; the readings have also aged ${(Math.abs(preview.evidence_age_effect) * 100).toFixed(1)} points since the case was scored)</span>` : '');
           } catch (e) { showToast(`Error: ${e.message}`, 'error'); }
           btn.disabled = false;
         };
@@ -1959,7 +2158,7 @@ export function renderGovernance(el, state, h) {
     try {
       const { entries, chain_valid } = await api.get('/kb/ledger');
       setHTML('ledger-status', chain_valid ? '<span class="badge badge-green">Ledger verified</span>' : '<span class="badge badge-red">Ledger FAILED verification</span>');
-      const actionLabel = { proposal_submitted: 'Proposal submitted', proposal_approved: 'Approved', proposal_rejected: 'Rejected', proposal_revoked: 'Revoked', rollback: 'Rollback', seeded: 'Seeded', integrity_review: 'Integrity review' };
+      const actionLabel = { proposal_submitted: 'Proposal submitted', proposal_approved: 'Approved', proposal_signed_off: 'Signed off (one pill)', proposal_rejected: 'Rejected', proposal_revoked: 'Revoked', rollback_requested: 'Rollback asked for', rollback_rejected: 'Rollback refused', rollback: 'Rollback countersigned', seeded: 'Seeded', integrity_review: 'Integrity review' };
       setHTML('ledger-body', !entries.length
         ? '<p class="muted">No governance actions yet.</p>'
         : `<p class="muted" style="margin-bottom:8px">Every proposal, approval, rejection, rollback and integrity review, with who did it and why. Keyed hash chain: editing any entry breaks verification.</p>
@@ -1981,6 +2180,9 @@ export function renderGovernance(el, state, h) {
   const TAMPER_EVENTS = {
     snapshot_modified_between_saves: 'Snapshot changed on disk between saves',
     audit_chain_failure_on_load: 'Audit chain failed on restart',
+    anchor_missing: 'No integrity anchor for this database',
+    anchor_invalid: 'Integrity anchor was edited',
+    database_replaced: 'A different database was put in place',
   };
   async function loadTamperEvents() {
     const body = document.getElementById('tamper-body');
@@ -1996,8 +2198,22 @@ export function renderGovernance(el, state, h) {
         body.innerHTML = `<div class="empty-state"><div class="empty-state-icon">[!]</div><div class="empty-state-title">Clean</div><div class="empty-state-desc">No tamper events detected. Every snapshot written matches what this process last saw, and every audit chain verified on load.</div></div>`;
         return;
       }
-      body.innerHTML = `<div class="banner banner-warn" style="margin-bottom:8px"><p><strong>${events.length} integrity event(s) detected</strong> — the tampered snapshot was archived (see paths below) before the clean state overwrote the file, so no restart can erase the evidence.</p></div>
-        <ul style="margin:0 0 0 18px">${events.slice().reverse().map(e => `<li style="margin-bottom:6px"><strong>${esc(TAMPER_EVENTS[e.event] || e.event)}</strong> — ${esc(e.detail)}${e.archived_path ? ' · <code>' + esc(e.archived_path) + '</code>' : ''}<div class="muted" style="font-size:12px">${esc(e.at)}</div></li>`).join('')}</ul>`;
+      const archived = events.some(e => e.archived_path);
+      const open = events.filter(e => !e.acknowledged).length;
+      const canAck = api.can('review_audit_integrity');
+      body.innerHTML = `<div class="banner ${open ? 'banner-error' : 'banner-warn'}" style="margin-bottom:8px"><p><strong>${events.length} integrity event(s) recorded, ${open} not yet acknowledged.</strong> ${archived ? 'Where a snapshot was tampered with, it was archived (paths below) before the clean state overwrote the file, so no restart can erase the evidence.' : 'Each says what was found.'} ${open && !canAck ? 'An auditor acknowledges each one here.' : ''}</p></div>
+        <ul style="margin:0 0 0 18px">${events.slice().reverse().map(e => `<li style="margin-bottom:6px"><strong>${esc(TAMPER_EVENTS[e.event] || e.event)}</strong> — ${esc(e.detail)}${e.archived_path ? ' · <code>' + esc(e.archived_path) + '</code>' : ''}<div class="muted" style="font-size:12px">${esc(e.at)} · ${e.acknowledged ? 'acknowledged by an auditor' : '<strong>not acknowledged</strong>'}</div>
+          ${!e.acknowledged && canAck ? `<div class="flex gap-8 flex-wrap align-center mt-16"><input type="text" class="tamper-reason" data-at="${esc(e.at)}" placeholder="Reason (required)" aria-label="Reason for acknowledging this event" style="flex:1 1 240px"><button class="btn btn-secondary btn-sm" data-ack="${esc(e.at)}">Acknowledge</button></div>` : ''}</li>`).join('')}</ul>`;
+      body.querySelectorAll('[data-ack]').forEach(b => b.onclick = async () => {
+        const reason = body.querySelector(`.tamper-reason[data-at="${CSS.escape(b.dataset.ack)}"]`).value.trim();
+        if (!reason) { showToast('Give a reason for acknowledging this event', 'error'); return; }
+        try {
+          await api.post(`/audit/tamper/acknowledge?event_at=${encodeURIComponent(b.dataset.ack)}&reason=${encodeURIComponent(reason)}`);
+          showToast('Tamper event acknowledged in the ledger', 'success');
+          loadTamperEvents();
+          loadIntegrity();
+        } catch (e) { showToast(`Error: ${e.message}`, 'error'); }
+      });
     } catch (e) {
       setHTML('tamper-body', isForbidden(e)
         ? rbacNote('Integrity events', 'auditors, knowledge stewards and admins')
@@ -2026,8 +2242,10 @@ export function renderCapture(el, state, h) {
   const canCapture = api.can('capture_expert_knowledge');
   let draft = null;      // last AI draft from /capture/draft
   let submitted = null;  // proposal after submit
+  let draftRun = 0;      // bumped when a draft is abandoned, so a late AI reply is ignored
 
   el.innerHTML = `
+    <h2 class="sr-only">Capture expert knowledge</h2>
     ${nextHint('a different knowledge steward must approve this draft before it is reused in diagnoses.')}
     <ol class="cap-steps" id="cap-steps" aria-label="Capture progress">
       <li data-step="1">Interview</li>
@@ -2131,17 +2349,23 @@ export function renderCapture(el, state, h) {
   // The grounding check, made visible: what the AI drafted that survived
   // (it is in the expert's own answer) and what it said that did not.
   function groundingCard(d) {
-    const kept = d.heuristics.flatMap(x => [...(x.checks || []), ...(x.do_not || []), ...(x.escalate_when || [])]);
+    // Each kept line keeps its field, so a "Never" line never reads as an instruction.
+    const kept = d.heuristics.flatMap(x => [
+      ...(x.checks || []).map(t => ['Check', t]), ...(x.do_not || []).map(t => ['Never', t]),
+      ...(x.escalate_when || []).map(t => ['Escalate when', t])]);
     const rejected = d.rejected || [];
+    const unused = d.unused_answers || [];
     const fieldName = { check: 'Check', never: 'Never', 'escalate-when': 'Escalate when', heuristic: 'Heuristic' };
+    // A line the expert said in another answer can become its own item, by hand.
+    const movable = r => r.field !== 'heuristic' && /different answer/.test(r.reason);
     return `<div class="card grounding-card"><div class="card-header"><h3>Grounding check</h3>
-        <span class="badge ${rejected.length ? 'badge-red' : 'badge-green'}">${kept.length} kept · ${rejected.length} rejected</span></div>
+        <span class="badge ${rejected.length || unused.length ? 'badge-red' : 'badge-green'}">${kept.length} kept · ${rejected.length} rejected · ${unused.length} answer${unused.length === 1 ? '' : 's'} with no knowledge</span></div>
       <div class="card-body">
         <p class="muted" style="margin-bottom:8px">Every line the AI drafted must be the expert's own words from the same answer, and must not defeat a safety device. Anything else is rejected here and again on the server when you send.</p>
         <ul class="ground-list">
-          ${kept.slice(0, 4).map(l => `<li class="ground-ok"><span aria-hidden="true">✓</span> ${esc(l)}</li>`).join('')}
-          ${kept.length > 4 ? `<li class="muted">… and ${kept.length - 4} more kept</li>` : ''}
-          ${rejected.map(r => `<li class="ground-bad"><span aria-hidden="true">✗</span> <span class="sr-only">Rejected:</span> <strong>${esc(fieldName[r.field] || r.field)}:</strong> “${esc(r.text)}” <span class="ground-why">${esc(r.reason)}</span></li>`).join('')}
+          ${kept.map(([f, l]) => `<li class="ground-ok"><span aria-hidden="true">✓</span> <span class="sr-only">Kept:</span> <strong>${f}:</strong> “${esc(l)}”</li>`).join('')}
+          ${rejected.map((r, i) => `<li class="ground-bad"><span aria-hidden="true">✗</span> <span class="sr-only">Rejected:</span> <strong>${esc(fieldName[r.field] || r.field)}:</strong> “${esc(r.text)}” <span class="ground-why">${esc(r.reason)}</span>${movable(r) ? ` <button class="btn btn-secondary btn-sm ground-move" data-i="${i}">Add it as its own item</button>` : ''}</li>`).join('')}
+          ${unused.map(u => `<li class="ground-bad"><span aria-hidden="true">!</span> <span class="sr-only">No knowledge drafted:</span> <strong>Expert answer:</strong> “${esc(u.excerpt)}” <span class="ground-why">${esc(u.reason)}</span></li>`).join('')}
         </ul>
         ${d.heuristics.length ? `<div class="ground-try">
           <label for="gt-line">Try to slip in a line the expert never said</label>
@@ -2196,16 +2420,18 @@ export function renderCapture(el, state, h) {
         return other.map(w => `<div class="banner banner-warn"><p>${esc(w)}</p></div>`).join('')
           + (moved.length ? `<div class="banner banner-info"><p><strong>Filed under other pills:</strong> ${moved.map(x => `${esc(x.cause_label)} goes to ${esc(x.asset_type)}`).join('; ')}. Each pill only uses knowledge about its own equipment.</p></div>` : '');
       })()}
+      ${(draft.recheck || []).length ? `<div class="banner banner-warn" role="alert"><p><strong>Re-checked before sending:</strong> the server's grounding check changed the wording of item(s) ${draft.recheck.join(', ')} (a line the expert did not say in that answer was dropped, or the WHEN was replaced by the expert's own sentence). Nothing was sent. Below is exactly what will be stored.</p></div>` : ''}
       ${groundingCard(draft)}
       <p class="muted cap-hint">Untick anything that is wrong or unclear and correct causes where needed. You cannot add words the expert did not say: the server checks every quote again.</p>
       ${draft.heuristics.map((x, i) => heuristicCard(x, i, causes, true)).join('')}
-      ${draft.provider === 'manual' ? manualForm(causes) : ''}
+      ${manualForm(causes, draft.prefill)}
       <label class="hazard-ack"><input type="checkbox" id="cap-consent"> ${esc($('cap-name').value.trim() || 'The expert')} agreed to their words being recorded and reused as knowledge.</label>
       <div class="cap-submit">
         <button class="btn btn-primary" id="cap-submit">Send ${draft.heuristics.length} for steward approval</button>
         <span class="muted" id="cap-submit-note">A different knowledge steward must approve, and safety-review every check, before it goes live.</span>
       </div>`;
-    if (draft.provider === 'manual') wireManualForm(causes);
+    wireManualForm(causes);
+    wireGroundingMove();
     wireGroundingTry();
     const btn = $('cap-submit');
     const kept = () => [...document.querySelectorAll('.kh-keep')].filter(c => c.checked).map(c => +c.dataset.i);
@@ -2236,16 +2462,30 @@ export function renderCapture(el, state, h) {
   // know-how doesn't fit what the model drafted. The same rule applies:
   // every heuristic must quote the expert's own words from the transcript.
   const norm = t => t.replace(/\s+/g, ' ').trim().toLowerCase();
-  function manualForm(causes) {
-    return `<div class="card mt-16"><div class="card-header"><h3>Add a heuristic</h3></div><div class="card-body">
+  function manualForm(causes, prefill) {
+    const p = prefill || {};
+    const val = f => (p.field === f ? esc(p.text) : '');
+    return `<div class="card mt-16" id="mh-card"><div class="card-header"><h3>Add a heuristic</h3></div><div class="card-body">
+      <p class="muted" style="margin-bottom:8px">Add something the expert said that the draft missed, or a line the check put in another answer. Its quote is checked against the transcript again when you send.</p>
       <div class="form-group"><label for="mh-cause">Cause</label><select id="mh-cause">${causeOptions(causes)}</select></div>
-      <div class="form-group"><label for="mh-when">When (the symptom the expert described)</label><input id="mh-when" type="text"></div>
-      <div class="form-group"><label for="mh-checks">Checks (one per line)</label><textarea id="mh-checks" rows="3"></textarea></div>
-      <div class="form-group"><label for="mh-never">Never (one per line)</label><textarea id="mh-never" rows="2"></textarea></div>
-      <div class="form-group"><label for="mh-esc">Escalate when (one per line)</label><textarea id="mh-esc" rows="2"></textarea></div>
-      <div class="form-group"><label for="mh-quote">Expert's own words (copy exactly from the transcript)</label><textarea id="mh-quote" rows="2"></textarea></div>
+      <div class="form-group"><label for="mh-when">When (the symptom the expert described)</label><input id="mh-when" type="text" value="${p.text ? esc(p.text) : ''}"></div>
+      <div class="form-group"><label for="mh-checks">Checks (one per line)</label><textarea id="mh-checks" rows="3">${val('check')}</textarea></div>
+      <div class="form-group"><label for="mh-never">Never (one per line)</label><textarea id="mh-never" rows="2">${val('never')}</textarea></div>
+      <div class="form-group"><label for="mh-esc">Escalate when (one per line)</label><textarea id="mh-esc" rows="2">${val('escalate-when')}</textarea></div>
+      <div class="form-group"><label for="mh-quote">Expert's own words (copy exactly from the transcript)</label><textarea id="mh-quote" rows="2">${p.text ? esc(p.text) : ''}</textarea></div>
       <button class="btn btn-secondary" id="mh-add">Add heuristic</button>
     </div></div>`;
+  }
+  // Rejected lines that the expert did say, in another answer, can be moved
+  // into the form as their own item. Nothing is added here: the form still
+  // goes through the server's grounding check when the review is sent.
+  function wireGroundingMove() {
+    document.querySelectorAll('.ground-move').forEach(btn => btn.onclick = () => {
+      const r = (draft.rejected || [])[+btn.dataset.i];
+      if (!r) return;
+      draft.prefill = { text: r.text, field: r.field };
+      renderDraft().then(() => $('mh-card') && $('mh-card').scrollIntoView({ block: 'start' }));
+    });
   }
   function wireManualForm(causes) {
     const lines = id => $(id).value.split('\n').map(x => x.trim()).filter(Boolean);
@@ -2257,12 +2497,14 @@ export function renderCapture(el, state, h) {
       const c = causes.find(x => x.id === $('mh-cause').value);
       draft.heuristics.push({ symptom_pattern: when, likely_cause: c.id, cause_label: c.label, asset_type: c.asset_type,
         checks: lines('mh-checks'), do_not: lines('mh-never'), escalate_when: lines('mh-esc'), evidence_quote: quote });
+      draft.prefill = null;
       renderDraft();
     };
   }
 
   $('cap-manual').onclick = () => {
     if (!text.value.trim()) { showToast('Paste the interview transcript first', 'error'); text.focus(); return; }
+    draftRun++;  // a draft still running is abandoned
     draft = { provider: 'manual', heuristics: [], warnings: [], dropped: 0 }; submitted = null;
     renderDraft();
   };
@@ -2282,10 +2524,12 @@ export function renderCapture(el, state, h) {
         draft_id: draft.draft_id, expert_consent: true,
       });
       submitted = d;
+      draft.recheck = null;
       setStep(4); setStatus('Waiting for second steward', 'badge-yellow'); $('cap-right-title').textContent = '4. Sent for approval';
       const causes = await loadCauses();
       $('cap-result').innerHTML = `
-        <div class="banner banner-success"><p><strong>Sent as ${esc(d.proposal_id)}.</strong> Nothing is live yet. A knowledge steward other than you (${esc(role)}) must approve it on the Governance screen.</p></div>
+        <div class="banner banner-success"><p><strong>Sent as ${esc(d.proposal_id)}.</strong> Nothing is live yet. A knowledge steward other than you (${esc(role)}) must approve it on the Governance screen. What you see below is exactly what the steward will see.</p></div>
+        ${d.duplicate_of ? `<div class="banner banner-warn"><p>The same expert words are already with the stewards as <strong>${esc(d.duplicate_of)}</strong>. The steward is told, so they can reject the copy.</p></div>` : ''}
         <div class="flex gap-8 flex-wrap" style="margin:12px 0">${modelBadge(d)}<span class="badge badge-green">${d.heuristics.length} heuristic(s) sent</span></div>
         ${d.heuristics.map((x, i) => heuristicCard(x, i, causes, false)).join('')}
         <div class="flex gap-8 flex-wrap mt-16">
@@ -2296,6 +2540,15 @@ export function renderCapture(el, state, h) {
       $('cap-new').onclick = () => navigate('capture');
       showToast(`${d.proposal_id} sent for steward approval`, 'success');
     } catch (e) {
+      if (e.status === 409 && e.detail && e.detail.heuristics) {
+        // The server's re-check would store different wording than shown.
+        // Nothing was queued: show the re-checked text, then send again.
+        draft.heuristics = e.detail.heuristics;
+        draft.recheck = e.detail.changed_items;
+        await renderDraft();
+        showToast('The re-check changed some wording. Review it, then send again.', 'error');
+        return;
+      }
       btn.disabled = false; btn.textContent = 'Try sending again';
       showToast(`Could not send: ${e.message}`, 'error');
     }
@@ -2312,12 +2565,39 @@ export function renderCapture(el, state, h) {
     const run = $('cap-run');
     run.disabled = true; run.textContent = 'Drafting…';
     setStep(2); setStatus('Drafting…', 'badge-blue'); submitted = null;
-    $('cap-result').innerHTML = '<div class="skeleton-card"><div class="skeleton-line"></div><div class="skeleton-line"></div><div class="skeleton-line"></div></div><p class="muted">The model is reading the interview. Each heuristic must quote the expert word for word.</p>';
+    // The model can take a minute or two. Say what is happening, how long it
+    // has taken, and offer the manual route once it runs long.
+    $('cap-result').innerHTML = `<div class="skeleton-card"><div class="skeleton-line"></div><div class="skeleton-line"></div><div class="skeleton-line"></div></div>
+      <p id="cap-progress-step" class="cap-progress-step"></p>
+      <p class="muted" id="cap-progress-time"></p>
+      <div id="cap-progress-slow" hidden><div class="banner banner-info mt-16"><p>Taking longer than usual. Drafts often take a minute or two. You can keep waiting, or write the heuristics by hand now; nothing is sent until you choose.</p>
+        <button class="btn btn-secondary mt-16" id="cap-progress-manual">Write heuristics by hand</button></div></div>`;
+    const started = Date.now();
+    const myRun = ++draftRun;
+    const stepFor = secs => secs < 4 ? 'Sending the transcript. Anything that looks like an instruction is removed first.'
+      : secs < 20 ? 'The model is reading the expert\'s answers and drafting candidate knowledge.'
+      : secs < 45 ? 'Still working. Each heuristic is checked against the transcript as it comes back.'
+      : 'Still working on the draft.';
+    const ticker = setInterval(() => {
+      const secs = Math.floor((Date.now() - started) / 1000);
+      const step = $('cap-progress-step'), time = $('cap-progress-time'), slow = $('cap-progress-slow');
+      if (!step) { clearInterval(ticker); return; }
+      step.textContent = stepFor(secs);
+      time.textContent = `Elapsed ${secs} s`;
+      if (slow) slow.hidden = secs < 45;
+      const manualNow = $('cap-progress-manual');
+      if (manualNow) manualNow.onclick = () => { clearInterval(ticker); $('cap-manual').click(); };
+    }, 1000);
     try {
-      draft = await thinking(api.postJson('/capture/draft', { asset_type: $('cap-asset').value, transcript: text.value }));
+      const got = await thinking(api.postJson('/capture/draft', { asset_type: $('cap-asset').value, transcript: text.value }));
+      clearInterval(ticker);
       window.__app__?.refreshSystemInfo?.();  // the AI chip reflects this call's outcome
+      if (myRun !== draftRun) return;  // the person has moved on to writing it by hand
+      draft = got;
       await renderDraft();
     } catch (e) {
+      clearInterval(ticker);
+      if (myRun !== draftRun) return;
       draft = null; setStep(1); setStatus('Draft failed', 'badge-red');
       window.__app__?.refreshSystemInfo?.();
       const aiDown = /extraction failed|ADP|reach|key/i.test(e.message);

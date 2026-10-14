@@ -25,7 +25,7 @@ def test_kb_versions_maps_int_to_the_same_label_shown_on_screen(client: TestClie
     assert any(v["version"] == 0 for v in body["versions"])
 
 
-def test_rollback_endpoint_and_versions_endpoint_agree_after_an_approval(client: TestClient):
+def test_rollback_endpoint_and_versions_endpoint_agree_after_an_approval(client: TestClient, rollback):
     before = client.get("/kb/versions", params={"user": "tech1", "pill": "CRAH"}).json()
     # Approve something to move the version forward.
     resp = client.post("/cases", params={
@@ -49,8 +49,7 @@ def test_rollback_endpoint_and_versions_endpoint_agree_after_an_approval(client:
     used_labels = {v["label"] for v in before["versions"]}
     assert after["current_label"] not in used_labels, "a version label must never be reused"
     # Rolling back to the pre-approval version via the exact int /kb/versions offered.
-    resp = client.post(f"/kb/rollback/{before['current_version']}", params={"user": "admin1", "pill": "CRAH", "reason": "test rollback"})
-    assert resp.status_code == 200, resp.text
+    rollback("CRAH", before['current_version'], "test rollback")
     restored = client.get("/kb/versions", params={"user": "tech1", "pill": "CRAH"}).json()
     assert restored["current_label"] == before["current_label"]
 
@@ -60,7 +59,7 @@ def test_chiller_dc1_02_resolves_to_condenser_fouling(client: TestClient):
     so condenser-fouling knowledge (e.g. from the sample interview) could
     never be demonstrated as reused. CHILLER-DC1-02 closes that gap."""
     resp = client.post("/cases", params={
-        "asset_id": "CHILLER-DC1-02", "sensor_id": "CHILLER-DC1-02-s", "user": "tech1",
+        "asset_id": "CHILLER-DC1-02", "sensor_id": "CH2-COMP-PRESSURE", "user": "tech1",
         "observation_type": "chiller_compressor_trip", "reading_status": "absent",
     })
     case_id = resp.json()["case_id"]
@@ -72,7 +71,7 @@ def test_chiller_dc1_02_resolves_to_condenser_fouling(client: TestClient):
 def test_pump_dc1_02_resolves_to_cavitation(client: TestClient):
     """Previously: every pump case always resolved to shaft_misalignment."""
     resp = client.post("/cases", params={
-        "asset_id": "PUMP-DC1-02", "sensor_id": "PUMP-DC1-02-s", "user": "tech1",
+        "asset_id": "PUMP-DC1-02", "sensor_id": "PUMP-DC1-02-VIB", "user": "tech1",
         "observation_type": "pump_vibration_high", "reading_status": "absent",
     })
     case_id = resp.json()["case_id"]

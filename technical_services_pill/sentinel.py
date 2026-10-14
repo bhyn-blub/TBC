@@ -99,9 +99,25 @@ def inspect(state: AgentState) -> list[str]:
             findings.append(f"evidence item {ev.type!r} has an unexpected source or shape")
 
     # 3. Grounding: an actionable recommendation cites knowledge and this case's evidence.
+    # The exception is an action the AOM chose by Modify: it was drawn from no
+    # knowledge, so it must cite none, and it must be one of this fault's
+    # tree procedures, unchanged (checked here independently of the endpoint).
     rec = state.recommendation
+    hd = state.human_decision
     if rec and rec.actions:
-        if not rec.kb_refs:
+        aom_written = bool(hd and hd.decision.value == "modify" and hd.modified_actions
+                           and [a.model_dump() for a in rec.actions]
+                           == [a.model_dump() for a in hd.modified_actions])
+        if aom_written:
+            from .decision_tree import is_action_template
+
+            if rec.kb_refs or any(a.kb_refs for a in rec.actions):
+                findings.append("an action the AOM chose cites knowledge it was not drawn from")
+            for a in rec.actions:
+                if not is_action_template(state.observation.type, a.type, a.target, a.detail):
+                    findings.append(f"an action the AOM chose ({a.type}) is not one of this "
+                                    "fault's reviewed procedures")
+        elif not rec.kb_refs:
             findings.append("the recommendation cites no knowledge")
         gathered = {e.type for e in state.evidence}
         missing = [r for r in rec.evidence_refs if r not in gathered]

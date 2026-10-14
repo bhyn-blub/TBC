@@ -20,7 +20,7 @@
       }
     } catch (_) {}
   </script>
-  <link rel="stylesheet" href="/static/css/app.css?v=31">
+  <link rel="stylesheet" href="/static/css/app.css?v=38">
 </head>
 <body>
   <a class="skip-link" href="#content">Skip to main content</a>
@@ -59,7 +59,7 @@
         </button>
       </div>
       <div class="nav-footer" id="kb-footer">
-        <span id="nav-kb-version">KB loading…</span><br>
+        <span id="nav-kb-version">KB loading…</span><span class="nav-footer-short" aria-hidden="true">KB</span><br>
         <span class="nav-footer-sub">Keppel AI Harvest</span>
       </div>
     </nav>
@@ -81,7 +81,7 @@
           <span class="badge badge-purple" id="model-chip" title="AI used for expert capture and the advisory second opinion. Diagnosis itself is deterministic.">AI: ...</span>
           <button class="btn btn-secondary btn-sm" id="theme-toggle" aria-pressed="false" title="Switch between light and dark theme">Dark theme</button>
           <button class="btn btn-secondary btn-sm" id="guide-toggle" aria-expanded="false" aria-controls="guide-panel">Demo guide</button>
-          <span class="role-badge" id="role-badge">mgr1</span>
+          <span class="role-badge" id="role-badge">Not signed in</span>
           </div>
           <span class="acting-as">
             <label for="role-select" class="role-label">Acting as</label>
@@ -106,6 +106,8 @@
   <div id="pin-backdrop" class="pin-backdrop" hidden>
     <form id="pin-dialog" class="pin-dialog" role="dialog" aria-modal="true" aria-labelledby="pin-title">
       <h2 id="pin-title">Sign in</h2>
+      <p id="pin-intro">Demo accounts. Pick one and enter its PIN; each one shows a different part of the workflow.</p>
+      <ul id="pin-accounts" class="pin-accounts" aria-label="Demo accounts"></ul>
       <p id="pin-prompt">Enter the PIN for this user.</p>
       <label for="pin-input" class="role-label">PIN</label>
       <input id="pin-input" type="password" inputmode="numeric" autocomplete="off" maxlength="12" required>
@@ -129,6 +131,6 @@
       {% endfor %}
     ];
   </script>
-  <script type="module" src="/static/js/app.js?v=42"></script>
+  <script type="module" src="/static/js/app.js?v=47"></script>
 </body>
 </html>

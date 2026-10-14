@@ -126,7 +126,7 @@ def test_knowledge_changes_freeze_while_the_ledger_fails_verification(client):
 
 
 # 3. Per-pill knowledge --------------------------------------------------------
-def test_rolling_back_one_pill_leaves_the_others_alone(client):
+def test_rolling_back_one_pill_leaves_the_others_alone(client, rollback):
     pid = _queued_capture("steward1")
     before = {pill: LSTORE.version_of(pill) for pill in ("Chiller", "Pump")}
     LSTORE.approve_proposal(pid, decided_by="steward2", rationale="checked against the transcript",
@@ -134,9 +134,7 @@ def test_rolling_back_one_pill_leaves_the_others_alone(client):
     after = {pill: LSTORE.version_of(pill) for pill in ("Chiller", "Pump")}
     assert all(after[p] == before[p] + 1 for p in after)
 
-    resp = client.post(f"/kb/rollback/{before['Pump']}",
-                       params={"user": "admin1", "pill": "Pump", "reason": "bad pump advice"})
-    assert resp.status_code == 200, resp.text
+    rollback("Pump", before['Pump'], "bad pump advice")
     assert LSTORE.version_of("Pump") == before["Pump"]
     assert LSTORE.version_of("Chiller") == after["Chiller"]
     live = {(h["asset_type"], h["kb_version"]) for h in LSTORE.expert_heuristics}
@@ -151,16 +149,16 @@ def test_rollback_needs_a_known_pill(client):
 
 
 # 4. Identity -------------------------------------------------------------------
-def test_logout_revokes_the_unlock_cookie(monkeypatch):
+def test_logout_revokes_the_session_cookie(monkeypatch):
     monkeypatch.setenv("TBC_DEMO_INSECURE", "0")
     auth._failures.clear()
     c = TestClient(app)
     assert c.post("/login", json={"user_id": "tech1", "pin": "1111"}).status_code == 200
-    unlock = c.cookies.get(auth.UNLOCK_COOKIE)
-    assert unlock
+    session = c.cookies.get(auth.SESSION_COOKIE)
+    assert session
     c.post("/logout")
-    c.cookies.set(auth.UNLOCK_COOKIE, unlock)  # replay the old cookie
-    assert c.post("/login", json={"user_id": "tech1"}).status_code == 401
+    c.cookies.set(auth.SESSION_COOKIE, session)  # replay the old cookie
+    assert c.get("/me").status_code == 401
 
 
 def test_a_non_ascii_pin_is_a_failed_login_not_a_crash(monkeypatch):
@@ -169,3 +167,26 @@ def test_a_non_ascii_pin_is_a_failed_login_not_a_crash(monkeypatch):
     c = TestClient(app)
     assert c.post("/login", json={"user_id": "tech1", "pin": "１１１１"}).status_code == 401
     auth._failures.clear()
+
+
+def test_everyday_ways_to_defeat_a_protection_are_screened():
+    from technical_services_pill.safety import defeats_safety, touches_protection
+
+    for line in ("touch the two pins together on the pressure switch", "Tape over the buzzer",
+                 "Swap the fuse for a bigger one", "Hold the reset button down with a cable tie"):
+        assert defeats_safety(line), line
+    # Named but not defeated: held for the steward's safety review.
+    assert not defeats_safety("Swap the fuse for a 32 amp one")
+    assert touches_protection("Swap the fuse for a 32 amp one")
+    assert touches_protection("press the reset button once and watch it")
+    assert not defeats_safety("Never tape over the buzzer")
+
+
+def test_more_protections_are_screened():
+    from technical_services_pill.safety import defeats_safety, touches_protection
+
+    for line in ("disable the earth leakage relay", "pull the fuse on the leak alarm",
+                 "tape the float switch up", "Silence the VESDA"):
+        assert defeats_safety(line), line
+    assert touches_protection("put the UPS in maintenance bypass and swap the cells hot")
+    assert not defeats_safety("Never silence the VESDA")

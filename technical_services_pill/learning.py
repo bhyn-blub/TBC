@@ -63,6 +63,9 @@ _STOP = {
     "week", "usually", "story", "especially", "almost", "never", "always", "just", "only",
     "first", "thing", "look", "check", "sure", "make", "it's", "that's", "sensor", "sensors",
     "pump", "chiller", "unit", "ups", "crah", "if", "the", "and", "for", "you", "it",
+    # "past" comes from the is_past_calibration flag name, not from what an
+    # expert said to look for: on its own it is not a match.
+    "past",
 }
 
 
@@ -129,6 +132,8 @@ class LearningStore:
         self.validated: list[ValidatedCase] = []
         self._cause_stats: dict[str, dict[str, int]] = {}  # derived; see rebuild_stats
         self._proposals: list[dict[str, Any]] = []
+        # Rollbacks wait here until the pill's steward countersigns them.
+        self.rollback_requests: list[dict[str, Any]] = []
         self._kb_version: dict[str, int] = {pill: 0 for pill in PILLS}
         # Highest version ever issued per pill; never decremented.
         self._version_seq: dict[str, int] = {pill: 0 for pill in PILLS}
@@ -142,6 +147,11 @@ class LearningStore:
         # chain, so editing knowledge or truncating the ledger is caught.
         self.ledger: list[dict[str, Any]] = []
         self.ledger_seal: str | None = None
+        # The longest ledger this deployment has recorded ({length, head}),
+        # read from a signed anchor kept outside the database. The seal
+        # above lives inside the snapshot it protects, so it cannot tell an
+        # older genuine snapshot put back in place; the anchor can.
+        self.anchor: dict[str, Any] | None = None
         # {pill, version the withdrawn knowledge went live at, ledger seq}
         self._revocations: list[dict[str, Any]] = []
         self.expert_heuristics: list[dict[str, Any]] = []
@@ -224,7 +234,8 @@ class LearningStore:
             "revocations": self._revocations,
             "validated": sorted(
                 (vc.id, vc.case_id, vc.asset_type, vc.confirmed_cause, vc.outcome,
-                 vc.kb_version, vc.weight, vc.fault_signature, vc.validated_by, vc.action_taken)
+                 vc.kb_version, vc.weight, vc.fault_signature, vc.validated_by, vc.action_taken,
+                 vc.proposed_cause)
                 for vc in self.validated
             ),
             # Every field shown to an AOM is covered, not only the ids.
@@ -241,6 +252,10 @@ class LearningStore:
                  p.get("confirmed_cause"), p.get("asset_type"), p.get("kb_versions"), p.get("reason"),
                  p.get("expert_name"), p.get("resolution"), p.get("heuristics"),
                  p.get("rolled_back_pills"))
+                # Appended only when present, so ledgers sealed before
+                # per-pill sign-off existed still verify.
+                + ((p["signoffs"],) if p.get("signoffs") else ())
+                + ((tuple(p["revoked_pills"]),) if p.get("revoked_pills") else ())
                 for p in self._proposals
             ],
         }
@@ -255,8 +270,19 @@ class LearningStore:
             return False
         if self.ledger[-1]["kb_digest"] != self._kb_digest():
             return False
+        if self._behind_anchor():
+            return False
         return self.ledger_seal == compute_hash(
             "seal", {"length": len(self.ledger), "head": self.ledger[-1]["hash"]})
+
+    def _behind_anchor(self) -> bool:
+        """True if this ledger is not an extension of the one the anchor
+        recorded: an older copy was put back, or history was rewritten."""
+        a = self.anchor
+        if not a:
+            return False
+        n = int(a.get("length") or 0)
+        return len(self.ledger) < n or (n > 0 and self.ledger[n - 1].get("hash") != a.get("head"))
 
     def review_broken_ledger(self, *, actor: str, reason: str) -> dict[str, Any]:
         """An auditor's disposition of a ledger that failed verification: the
@@ -271,6 +297,9 @@ class LearningStore:
         problem = self.ledger_problem()
         resign_chain(self.ledger, LEDGER_FIELDS)
         self.rebuild_stats()
+        # Accepting an older copy (a restore from backup, say) makes it the
+        # new baseline; the next save records a fresh anchor.
+        self.anchor = None
         return self._log(actor=actor, action="integrity_review",
                          reason=f"knowledge ledger accepted after review ({problem}; failed head "
                                 f"{old_head[:12]}): {reason}")
@@ -289,6 +318,11 @@ class LearningStore:
             return "the ledger is empty"
         if self._cause_stats != self._derived_stats():
             return "cause statistics no longer match the validated cases"
+        if self._behind_anchor():
+            return (f"an older copy of the knowledge base was put back: this deployment last recorded "
+                    f"{self.anchor['length']} ledger entries and the one loaded "
+                    + (f"has {len(self.ledger)}" if len(self.ledger) < self.anchor["length"]
+                       else "diverges from that history"))
         if self.ledger[-1]["kb_digest"] != self._kb_digest():
             return ("the knowledge base (cases, expert heuristics, proposals or versions) was changed "
                     f"outside the governance flow after entry #{self.ledger[-1]['seq']}")
@@ -469,10 +503,16 @@ class LearningStore:
         return p
 
     def approve_proposal(self, proposal_id: str, *, decided_by: str, rationale: str,
-                         safety_reviewed: bool = False) -> dict[str, Any]:
+                         safety_reviewed: bool = False,
+                         signing_for: list[str] | None = None) -> dict[str, Any]:
         """Approve a pending proposal: its knowledge goes live and each pill
         it files knowledge under moves to a new version. Expert knowledge
-        needs the approver's explicit safety review (``needs_safety_review``)."""
+        needs the approver's explicit safety review (``needs_safety_review``).
+
+        ``signing_for`` names the pills this approver decides for. When a
+        proposal files knowledge under several pills, each pill's steward
+        signs off; nothing goes live until every pill has, and the proposal
+        stays pending in between."""
         self._require_verified()
         if not rationale.strip():
             raise ValueError("approving knowledge needs a rationale")
@@ -483,6 +523,17 @@ class LearningStore:
                 f"approving expert knowledge needs a safety review: confirm that none of its "
                 f"{len(held)} check(s) or protective-device line(s) tells anyone to defeat, bypass "
                 "or weaken a protection (safety_reviewed=true)")
+        if signing_for is not None:
+            signoffs = p.setdefault("signoffs", {})
+            for pill in signing_for:
+                signoffs[pill] = {"by": decided_by, "at": _now().isoformat(),
+                                  "rationale": rationale.strip(), "safety_reviewed": bool(held)}
+            remaining = [x for x in proposal_pills(p) if x not in signoffs]
+            if remaining:
+                self._log(actor=decided_by, action="proposal_signed_off", proposal_id=proposal_id,
+                          reason=f"signed off {', '.join(sorted(signing_for))}; waiting for "
+                                 f"{', '.join(remaining)}: {rationale.strip()}")
+                return p
         before = dict(self._kb_version)
         if held:
             p["safety_reviewed_by"] = decided_by
@@ -592,10 +643,15 @@ class LearningStore:
                   reason=reason.strip())
         return p
 
-    def revoke_proposal(self, proposal_id: str, *, actor: str, reason: str) -> dict[str, Any]:
+    def revoke_proposal(self, proposal_id: str, *, actor: str, reason: str,
+                        pills: list[str] | None = None) -> dict[str, Any]:
         """Withdraw one approved proposal's knowledge, leaving everything
         else. Each affected pill moves to a new version; the revocation is
-        permanent (a later rollback does not bring it back)."""
+        permanent (a later rollback does not bring it back).
+
+        ``pills`` withdraws only that part of a proposal filed under several
+        pills (each pill's steward withdraws their own); the proposal is
+        revoked once every pill's part has been withdrawn."""
         self._require_verified()
         if not reason.strip():
             raise ValueError("a revocation needs a reason")
@@ -604,23 +660,121 @@ class LearningStore:
             raise ValueError(f"proposal {proposal_id} not found")
         if p["status"] != "approved":
             raise ValueError(f"proposal {proposal_id} is {p['status']}, not approved")
+        live = {pill: v for pill, v in (p.get("kb_versions") or {}).items()
+                if pill not in (p.get("rolled_back_pills") or [])
+                and pill not in (p.get("revoked_pills") or [])}
+        target = set(live) if pills is None else set(pills)
+        if not target or not target <= set(live):
+            raise ValueError(f"proposal {proposal_id} has no live knowledge under "
+                             f"{', '.join(sorted(target - set(live))) or 'those pills'}; "
+                             f"live: {', '.join(sorted(live)) or 'none'}")
         ids = set(p.get("expert_heuristic_ids") or [])
         if p.get("validated_case_id"):
             ids.add(p["validated_case_id"])
+        pill_of = {**{v.id: v.asset_type for v in self.validated},
+                   **{h["id"]: h.get("asset_type") for h in self.expert_heuristics}}
+        ids = {i for i in ids if pill_of.get(i) in target}
         removed = self._remove_where(lambda vc: vc.id not in ids)
-        self.expert_heuristics = [h for h in self.expert_heuristics if h.get("proposal_id") != proposal_id]
+        mine = {h["id"] for h in self.expert_heuristics if h.get("proposal_id") == proposal_id
+                and h.get("asset_type") in target}
+        self.expert_heuristics = [h for h in self.expert_heuristics if h["id"] not in mine]
         before = dict(self._kb_version)
-        p["status"] = "revoked"
-        still_live = {pill: v for pill, v in (p.get("kb_versions") or {}).items()
-                      if pill not in (p.get("rolled_back_pills") or [])}
+        if target == set(live):
+            p["status"] = "revoked"
+        else:
+            p["revoked_pills"] = sorted({*(p.get("revoked_pills") or []), *target})
+        still_live = {pill: v for pill, v in live.items() if pill in target}
         for pill, version in still_live.items():
             self._bump(pill, actor=actor, proposal_id=None)
             self._revocations.append({"pill": pill, "proposal_version": version,
                                       "ledger_seq": len(self.ledger) + 1})
+        part = "" if p["status"] == "revoked" else f"{', '.join(sorted(target))} part only: "
         self._log(actor=actor, action="proposal_revoked", proposal_id=proposal_id,
-                  reason=reason.strip(), versions_before=before)
+                  reason=part + reason.strip(), versions_before=before)
         return {"revoked": proposal_id, "removed_items": removed, "pills": sorted(still_live),
                 "kb_versions": {pill: self._kb_version[pill] for pill in still_live}}
+
+    def rollback_preview(self, pill: str, target_version: int) -> dict[str, Any]:
+        """What a rollback of ``pill`` to ``target_version`` would take away,
+        shown to the countersigning steward before they decide."""
+        return {
+            "validated_cases": sum(1 for vc in self.validated
+                                   if vc.asset_type == pill and vc.kb_version > target_version),
+            "expert_heuristics": sum(1 for h in self.expert_heuristics
+                                     if h["asset_type"] == pill and h["kb_version"] > target_version),
+            "proposals": [p["proposal_id"] for p in self._proposals
+                          if p["status"] == "approved"
+                          and (p.get("kb_versions") or {}).get(pill, -1) > target_version],
+            "versions": [f"{pill} v{kb_version_label(v['version'])}" for v in self._versions[pill]
+                         if v["status"] == "live" and v["version"] > target_version],
+        }
+
+    def request_rollback(self, pill: str, target_version: int, *, requested_by: str,
+                         reason: str) -> dict[str, Any]:
+        """Ask for a rollback. Nothing changes until a different steward who
+        decides ``pill`` countersigns it (``countersign_rollback``)."""
+        self._require_verified()
+        if not reason.strip():
+            raise ValueError("a rollback needs a reason")
+        if pill not in PILLS:
+            raise ValueError(f"unknown pill {pill!r}; expected one of {list(PILLS)}")
+        live = {v["version"] for v in self._versions[pill] if v["status"] == "live"}
+        if target_version not in live:
+            raise ValueError(f"{pill} version {target_version} is not in the live lineage "
+                             f"(live: {sorted(live)})")
+        if target_version == self._kb_version[pill]:
+            raise ValueError(f"{pill} is already at version {target_version}")
+        if any(r["pill"] == pill and r["status"] == "pending" for r in self.rollback_requests):
+            raise ValueError(f"a rollback of {pill} is already waiting for countersign")
+        req = {
+            "request_id": f"RBK-{len(self.rollback_requests) + 1:03d}",
+            "pill": pill, "target_version": target_version,
+            "target_label": f"{pill} v{kb_version_label(target_version)}",
+            "requested_by": requested_by, "reason": reason.strip(),
+            "requested_at": _now().isoformat(), "status": "pending",
+            "preview": self.rollback_preview(pill, target_version),
+            "decided_by": None, "decided_at": None, "decision_reason": "",
+        }
+        self.rollback_requests.append(req)
+        self._log(actor=requested_by, action="rollback_requested", reason=reason.strip())
+        return req
+
+    def find_rollback_request(self, request_id: str) -> dict[str, Any]:
+        req = next((r for r in self.rollback_requests if r["request_id"] == request_id), None)
+        if req is None:
+            raise ValueError(f"rollback request {request_id} not found")
+        return req
+
+    def countersign_rollback(self, request_id: str, *, decided_by: str,
+                             reason: str = "") -> dict[str, Any]:
+        """Countersign a pending rollback: it is carried out now, recorded
+        with both names in the ledger."""
+        req = self.find_rollback_request(request_id)
+        if req["status"] != "pending":
+            raise ValueError(f"rollback request {request_id} is {req['status']}, not pending")
+        if decided_by == req["requested_by"]:
+            raise SelfApprovalError(
+                f"{decided_by} asked for {request_id} and cannot also countersign it; "
+                "the pill's steward must")
+        result = self.rollback(req["pill"], req["target_version"],
+                               actor=f"{req['requested_by']}, countersigned by {decided_by}",
+                               reason=req["reason"])
+        req.update(status="countersigned", decided_by=decided_by,
+                   decided_at=_now().isoformat(), decision_reason=reason.strip())
+        return {**req, "result": result}
+
+    def reject_rollback(self, request_id: str, *, decided_by: str, reason: str) -> dict[str, Any]:
+        req = self.find_rollback_request(request_id)
+        if req["status"] != "pending":
+            raise ValueError(f"rollback request {request_id} is {req['status']}, not pending")
+        if decided_by == req["requested_by"]:
+            raise SelfApprovalError(f"{decided_by} asked for {request_id} and cannot also reject it")
+        if not reason.strip():
+            raise ValueError("refusing a rollback needs a reason")
+        req.update(status="rejected", decided_by=decided_by, decided_at=_now().isoformat(),
+                   decision_reason=reason.strip())
+        self._log(actor=decided_by, action="rollback_rejected", reason=reason.strip())
+        return req
 
     def rollback(self, pill: str, target_version: int, *, actor: str = "system",
                  reason: str = "") -> dict[str, Any]:
